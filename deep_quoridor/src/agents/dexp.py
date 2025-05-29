@@ -56,17 +56,19 @@ class DExpNetwork(nn.Module):
         elif nn_version == "5":
             # Define network architecture
             self.model = nn.Sequential(
-                nn.Linear(flat_input_size, 1024),
+                nn.Linear(flat_input_size, 2048),
                 nn.ReLU(),
                 nn.Dropout(0.1),
+                nn.Linear(2048, 1024),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(1024, 1024),
+                nn.ReLU(),
                 nn.Linear(1024, 512),
                 nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(512, 512),
+                nn.Linear(512, 256),
                 nn.ReLU(),
-                nn.Linear(512, 512),
-                nn.ReLU(),
-                nn.Linear(512, action_size),
+                nn.Linear(256, action_size),
             )
         else:
             raise RuntimeError(f"Model version does not exist: {nn_version}")
