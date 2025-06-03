@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from quoridor import ActionEncoder
+from quoridor import ActionEncoder, MoveAction, construct_game_from_observation
 from utils import SubargsBase, my_device, resolve_path
 from utils.misc import get_opponent_player_id
 
@@ -68,6 +68,8 @@ class TrainableAgentParams(SubargsBase):
     learning_rate: float = 0.001
     # Specifies the NN version to use
     nn_version: Optional[str] = None
+    # If true for each winning state, adds theorical immediate states that could led to that state
+    augment_states: bool = False
 
     @classmethod
     def training_only_params(cls) -> set[str]:
@@ -315,11 +317,124 @@ class AbstractTrainableAgent(TrainableAgent):
             np.zeros_like(1) if next_state_mask is None else next_state_mask,
         )
 
+        if self.params.augment_states and done:
+            augmented_states = self._generate_augmented_states(observation_after_action["observation"], agent_id, True)
+            more_states = self._generate_augmented_states(
+                self._convert_to_opponent_observation(observation_before_action["observation"]),
+                get_opponent_player_id(agent_id),
+                False,
+            )
+            augmented_states = augmented_states + more_states
+            for aug_state in augmented_states:
+                self.replay_buffer.add(
+                    aug_state,
+                    self._convert_to_tensor_index_from_action(action, agent_id),
+                    0,
+                    state_after_action
+                    if state_after_action is not None
+                    else np.zeros_like(state_before_action.cpu().numpy()),
+                    float(done),
+                    np.zeros_like(1) if next_state_mask is None else next_state_mask,
+                )
+
         if len(self.replay_buffer) > self.batch_size:
             loss = self._train(self.batch_size)
             if loss is not None:
                 self.avg_training_losses.append(loss)
         return reward
+
+    def _convert_to_opponent_observation(self, observation):
+        """Convert observation to represent opponent's perspective."""
+        # Create new dict to preserve key ordering of original
+        opp_observation = {}
+
+        # Copy values converting them as needed
+        for key, value in observation.items():
+            if key == "board":
+                # Swap player positions (1 and 2) in the board
+                board = value.copy()
+                board[board == 1] = 3  # temporary value
+                board[board == 2] = 1
+                board[board == 3] = 2
+                opp_observation[key] = board
+            elif key == "my_walls_remaining":
+                opp_observation[key] = observation["opponent_walls_remaining"]
+            elif key == "opponent_walls_remaining":
+                opp_observation[key] = observation["my_walls_remaining"]
+            elif key == "my_turn":
+                opp_observation[key] = not value
+            else:
+                # Copy any other values as-is
+                opp_observation[key] = value.copy() if isinstance(value, np.ndarray) else value
+
+        return opp_observation
+
+    def _generate_augmented_states(self, state_after_action, action_player_id, is_last_move):
+        """
+        Generate augmented states from the state after an action by:
+        1. Creating variations where the player could have moved from different positions
+        2. Creating variations by removing one wall at a time
+
+        Args:
+            state_after_action (dict): The observation after an action was taken
+            action_player_id (str): The player ID who took the action
+
+        Returns:
+            list[torch.Tensor]: List of augmented state tensors
+        """
+        augmented_states = []
+
+        # Create a copy of the observation to modify
+        base_obs = state_after_action.copy()
+        base_obs["my_turn"] = True
+        board = base_obs["board"].copy()
+        walls = base_obs["walls"].copy()
+
+        # Find current player position (marked as 1) and opponent position (marked as 2)
+        player_pos = np.where(board == 1)
+        player_pos = (player_pos[0][0], player_pos[1][0])
+        board[player_pos] = 0
+
+        q, pa, po = construct_game_from_observation(base_obs, action_player_id)
+        valid_moves = q.get_valid_actions(pa)
+        for move in valid_moves:
+            if not isinstance(move, MoveAction):  # Skip wall placements
+                continue
+
+            # Create new board state with player in different position
+            move_row = move.destination[0]
+            move_col = move.destination[1]
+            # print(f"P{action_player_id}")
+            # print(f"M to {move_row},{move_col}")
+            if move_row == (0 if action_player_id == "player_1" else self.board_size - 1):
+                continue
+            new_board = board.copy()
+            new_board[move_row, move_col] = 1  # Place player in new position
+
+            # Create new observation with modified board
+            new_obs = base_obs.copy()
+            new_obs["board"] = new_board
+            augmented_states.append(self._observation_to_tensor(new_obs, action_player_id))
+
+        # Generate states by removing one wall at a time
+        if not is_last_move and base_obs["my_walls_remaining"] < self.max_walls:
+            wall_size = self.board_size - 1
+            for i in range(wall_size):
+                for j in range(wall_size):
+                    for wall_type in range(2):  # 0 for vertical, 1 for horizontal
+                        if walls[i, j, wall_type] == 1:
+                            # Create new walls array with one wall removed
+                            new_walls = walls.copy()
+                            new_walls[i, j, wall_type] = 0
+
+                            # Create new observation with modified walls
+                            new_obs = base_obs.copy()
+                            new_obs["walls"] = new_walls
+                            new_obs["my_walls_remaining"] = new_obs["my_walls_remaining"] + 1
+                            augmented_states.append(self._observation_to_tensor(new_obs, action_player_id))
+        # print(f"State: {state_after_action}")
+        # print(f"Adding additional states: {len(augmented_states)}")
+        return augmented_states
 
     def compute_loss_and_reward(self, length: int) -> Tuple[float, float]:
         avg_reward = (

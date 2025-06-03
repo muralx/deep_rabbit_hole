@@ -70,6 +70,25 @@ class DExpNetwork(nn.Module):
                 nn.ReLU(),
                 nn.Linear(256, action_size),
             )
+        elif nn_version == "6":
+            # Define network architecture
+            self.model = nn.Sequential(
+                nn.Linear(flat_input_size, 4096),
+                nn.ReLU(),
+                nn.Linear(4096, 4096),
+                nn.ReLU(),
+                nn.Linear(4096, 4096),
+                nn.ReLU(),
+                nn.Linear(4096, 2048),
+                nn.ReLU(),
+                nn.Linear(2048, 1024),
+                nn.ReLU(),
+                nn.Linear(1024, 512),
+                nn.ReLU(),
+                nn.Linear(512, 256),
+                nn.ReLU(),
+                nn.Linear(256, action_size),
+            )
         else:
             raise RuntimeError(f"Model version does not exist: {nn_version}")
 
@@ -173,6 +192,11 @@ class DExpAgent(AbstractTrainableAgent):
             self.params.turn,
             self.params.nn_version if self.params.nn_version is not None else "4",
         )
+
+    def _create_criterion(self):
+        """Create the loss criterion."""
+        # TODO Try HuberLoss
+        return nn.HuberLoss().to(self.device)
 
     def handle_opponent_step_outcome(
         self,
