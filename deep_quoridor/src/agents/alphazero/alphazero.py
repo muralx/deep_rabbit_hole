@@ -7,12 +7,12 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
-import wandb
-from quoridor import ActionEncoder, construct_game_from_observation
+from quoridor import ActionEncoder, Player, construct_game_from_observation, get_player_and_opponent_from_observation
 from utils import my_device
 from utils.subargs import SubargsBase
 
-from agents.alphazero.mcts import MCTS
+import wandb
+from agents.alphazero.mcts import MCTS, QuoridorKey
 from agents.alphazero.nn_evaluator import NNEvaluator
 from agents.core import TrainableAgent
 
@@ -93,14 +93,18 @@ class AlphaZeroAgent(TrainableAgent):
         self.max_walls = max_walls
         self.action_space = action_space
         self.device = my_device()
+        self.visited_states = set()
 
         self.action_encoder = ActionEncoder(board_size)
         self.evaluator = NNEvaluator(self.action_encoder, self.device)
-        self.mcts = MCTS(params.mcts_n, params.mcts_ucb_c, self.evaluator)
+        self.mcts = MCTS(params.mcts_n, params.mcts_ucb_c, self.evaluator, self.visited_states)
         if params.training_mode:
             self.evaluator.train_prepare(params.learning_rate, params.batch_size, params.optimizer_iterations)
 
         self.episode_count = 0
+        self.last_tree = {}
+        self.last_tree[Player.ONE] = None
+        self.last_tree[Player.TWO] = None
 
         # When playing use 0.0 for temperature so we always chose the best available action.
         self.temperature = params.temperature if params.training_mode else 0.0
@@ -117,6 +121,7 @@ class AlphaZeroAgent(TrainableAgent):
         from metrics import Metrics
 
         self.metrics = Metrics(board_size, max_walls)
+        self.steps = 0
 
     def version(self):
         return "1.0"
@@ -158,6 +163,12 @@ class AlphaZeroAgent(TrainableAgent):
 
     def load_model(self, path):
         self.evaluator.network.load_state_dict(torch.load(path, map_location=my_device()))
+
+    def start_game(self, game, player_id):
+        self.visited_states.clear()
+        self.last_tree[Player.ONE] = None
+        self.last_tree[Player.TWO] = None
+        self.steps = 0
 
     def end_game(self, env):
         if not self.params.training_mode:
@@ -224,14 +235,40 @@ class AlphaZeroAgent(TrainableAgent):
         scores = {root_children[i].action_taken: visit_probs[i] for i in top_indices}
         self.action_log.action_score_ranking(scores)
 
+    def handle_opponent_step_outcome(
+        self,
+        opponent_observation_before_action,
+        my_observation_after_opponent_action,
+        opponent_observation_after_action,
+        opponent_reward,
+        opponent_action,
+        done,
+    ):
+        player, _ = get_player_and_opponent_from_observation(my_observation_after_opponent_action["observation"])
+        tree = self.last_tree[player]
+        if tree is None:
+            return
+        action = self.action_encoder.index_to_action(opponent_action)
+        self.last_tree[player] = next(filter(lambda n: n.action_taken == action, tree.children), None)
+
     def get_action(self, observation) -> int:
         game, player, _ = construct_game_from_observation(observation["observation"])
+        tree = self.last_tree[player]
 
-        # Run MCTS to get action visit counts
-        root_children = self.mcts.search(game)
+        root_children = None
+        if tree is not None:
+            root_children = self.mcts.search_from_root(tree)
+        else:
+            # Run MCTS to get action visit counts
+            root_children = self.mcts.search(game)
         visit_counts = np.array([child.visit_count for child in root_children])
         visit_counts_sum = np.sum(visit_counts)
         if visit_counts_sum == 0:
+            print(game)
+            print("node game")
+            print(tree.game)
+            print(f"steps: {self.steps} player {player} tree: {tree}")
+            print(root_children)
             raise RuntimeError("No nodes visited during MCTS")
 
         visit_probs = visit_counts / visit_counts_sum
@@ -248,16 +285,19 @@ class AlphaZeroAgent(TrainableAgent):
         # Sample from probability distribution
         best_child = np.random.choice(root_children, p=visit_probs)
         action = best_child.action_taken
-
+        self.visited_states.add(QuoridorKey(best_child.game))
+        best_child.parent = None
+        self.last_tree[player] = best_child
         # Store training data if in training mode
         if self.params.training_mode:
             # Convert visit counts to policy target (normalized)
-            policy_target = np.zeros(self.action_encoder.num_actions, dtype=np.float32)
+            policy_target = self.action_encoder.get_action_mask_template()
             for child in root_children:
                 action_index = self.action_encoder.action_to_index(child.action_taken)
                 policy_target[action_index] = child.visit_count / visit_counts_sum
             self.store_training_data(game, policy_target, player)
 
+        self.steps = self.steps + 1
         return self.action_encoder.action_to_index(action)
 
     def store_training_data(self, game, mcts_policy, player):

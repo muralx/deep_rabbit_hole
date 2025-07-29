@@ -1,4 +1,5 @@
 import numpy as np
+from numba import njit
 
 
 def create_rotation_mapping(board_size):
@@ -21,6 +22,7 @@ def create_rotation_mapping(board_size):
     return action_mapping_original_to_rotated, action_mapping_rotated_to_original
 
 
+@njit(cache=True)
 def rotate_action_vector(board_size, orig_vector):
     total_actions = board_size * board_size  # Movement actions
     wall_actions = (board_size - 1) ** 2  # Actions for each wall type
@@ -40,7 +42,7 @@ def rotate_action_vector(board_size, orig_vector):
     walls_h = np.rot90(walls_h, k=2).flatten()
 
     # Combine rotated masks back together
-    rotated_vector = np.concatenate([board_mask, walls_v, walls_h])
+    rotated_vector = np.concatenate((board_mask, walls_v, walls_h))
 
     return rotated_vector
 

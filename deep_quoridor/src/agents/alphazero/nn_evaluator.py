@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from quoridor import ActionEncoder, Board, Player, Quoridor
 
 from agents.alphazero.mlp_network import MLPNetwork
+from agents.core import rotation
 from agents.core.rotation import create_rotation_mapping
 
 INVALID_ACTION_VALUE = -1e32
@@ -53,7 +54,7 @@ class NNEvaluator:
 
         # If the game was originally rotated, rotate the resulting back to player 2's perspective
         if is_board_rotated:
-            policy_masked = policy_masked[self.action_mapping_rotated_to_original]
+            policy_masked = rotation.rotate_action_vector(self.action_encoder.board_size, policy_masked)
 
         return value, policy_masked
 
@@ -61,7 +62,7 @@ class NNEvaluator:
         """
         Rotate the policy vector to match the current player's perspective.
         """
-        return policy[self.action_mapping_original_to_rotated]
+        return rotation.rotate_action_vector(self.action_encoder.board_size, policy)
 
     def rotate_if_needed_to_point_downwards(self, game: Quoridor):
         """
