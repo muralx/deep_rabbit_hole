@@ -135,7 +135,9 @@ class NNEvaluator:
         if not self.network.training:
             self.network.train()  # Make sure we aren't in eval mode, which disables dropout
 
-        for _ in range(self.batches_per_iteration):
+        number = min(self.batches_per_iteration, len(replay_buffer) // self.batch_size + 1)
+        print(f"Training # {number} times")
+        for _ in range(number):
             # Sample random batch from replay buffer
             batch_data = random.sample(list(replay_buffer), self.batch_size)
 
