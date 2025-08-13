@@ -8,7 +8,13 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 import wandb
-from quoridor import ActionEncoder, Player, construct_game_from_observation, get_player_and_opponent_from_observation
+from quoridor import (
+    ActionEncoder,
+    MoveAction,
+    Player,
+    construct_game_from_observation,
+    get_player_and_opponent_from_observation,
+)
 from utils import my_device
 from utils.subargs import SubargsBase
 
@@ -45,6 +51,10 @@ class AlphaZeroParams(SubargsBase):
 
     # Number of MCTS selections
     mcts_n: int = 100
+
+    # If set, the number of MCTS selections is going to be mcts_k * n_actions, where n_actions
+    # is the number of actions available.
+    mcts_k: Optional[int] = None
 
     # A higher number favors exploration over exploitation
     mcts_ucb_c: float = 1.4
@@ -91,6 +101,7 @@ class AlphaZeroAgent(TrainableAgent):
         max_walls,
         observation_space=None,
         action_space=None,
+        evaluator=None,
         params=AlphaZeroParams(),
         **kwargs,
     ):
@@ -104,9 +115,20 @@ class AlphaZeroAgent(TrainableAgent):
 
         self.action_encoder = ActionEncoder(board_size)
         self.evaluator = NNEvaluator(self.action_encoder, self.device)
+        if evaluator is None:
+            self.evaluator = NNEvaluator(self.action_encoder, self.device)
+        else:
+            self.evaluator = evaluator
+
         self.mcts = MCTS(
-            params.mcts_n, params.mcts_ucb_c, self.evaluator, self.visited_states, params.mcts_pre_evaluate_nodes_total
+            params.mcts_n,
+            params.mcts_k,
+            params.mcts_ucb_c,
+            self.evaluator,
+            self.visited_states,
+            params.mcts_pre_evaluate_nodes_total,
         )
+
         if params.training_mode and params.train_every is not None:
             self.evaluator.train_prepare(params.learning_rate, params.batch_size, params.optimizer_iterations)
 
@@ -240,6 +262,8 @@ class AlphaZeroAgent(TrainableAgent):
         self,
         visit_probs,
         root_children,
+        root_value,
+        root_action,
     ):
         if not self.action_log.is_enabled():
             return
@@ -250,6 +274,7 @@ class AlphaZeroAgent(TrainableAgent):
 
         scores = {root_children[i].action_taken: visit_probs[i] for i in top_indices}
         self.action_log.action_score_ranking(scores)
+        self.action_log.action_text(root_action, f"{root_value:0.2f}")
 
     def handle_opponent_step_outcome(
         self,
@@ -271,12 +296,11 @@ class AlphaZeroAgent(TrainableAgent):
         game, player, _ = construct_game_from_observation(observation["observation"])
         tree = self.last_tree[player]
 
-        root_children = None
         if tree is not None:
-            root_children = self.mcts.search_from_root(tree)
+            root_children, root_value = self.mcts.search_from_root(tree)
         else:
             # Run MCTS to get action visit counts
-            root_children = self.mcts.search(game)
+            root_children, root_value = self.mcts.search(game)
         visit_counts = np.array([child.visit_count for child in root_children])
         visit_counts_sum = np.sum(visit_counts)
         if visit_counts_sum == 0:
@@ -288,7 +312,9 @@ class AlphaZeroAgent(TrainableAgent):
             raise RuntimeError("No nodes visited during MCTS")
 
         visit_probs = visit_counts / visit_counts_sum
-        self._log_action(visit_probs, root_children)
+        self._log_action(
+            visit_probs, root_children, float(root_value), MoveAction(game.board.get_player_position(player))
+        )
 
         if self.temperature == 0.0:
             max_value = np.max(visit_probs)

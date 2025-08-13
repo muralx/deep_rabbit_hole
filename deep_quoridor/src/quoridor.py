@@ -544,6 +544,9 @@ class Quoridor:
         # Combine all bytes and hash
         return hash(board_bytes + walls_remaining_bytes + player_byte + rotated_byte)
 
+    def is_rotated(self) -> bool:
+        return self._rotated
+
 
 def get_player_and_opponent_from_observation(observation):
     player_id = observation["player_turn"]
