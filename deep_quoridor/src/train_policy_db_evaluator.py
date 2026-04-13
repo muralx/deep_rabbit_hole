@@ -65,9 +65,9 @@ def child_action_index(row, col, action_type, board_size):
     if action_type == 2:  # pawn move
         return row * board_size + col
     elif action_type == 0:  # vertical wall
-        return board_size ** 2 + row * wall_size + col
+        return board_size**2 + row * wall_size + col
     elif action_type == 1:  # horizontal wall
-        return board_size ** 2 + wall_size ** 2 + row * wall_size + col
+        return board_size**2 + wall_size**2 + row * wall_size + col
     raise ValueError(f"Unknown action_type {action_type}")
 
 
@@ -100,7 +100,7 @@ def build_policy_from_children(conn, state_bytes, current_player, board_size, ma
 
     # Assign equal probability to all actions achieving the best value.
     policy = np.zeros(num_actions, dtype=np.float32)
-    for (row, col, action_type, child_state) in children:
+    for row, col, action_type, child_state in children:
         if child_db_vals[bytes(child_state)] == best_value:
             idx = child_action_index(row, col, action_type, board_size)
             policy[idx] = 1.0
@@ -132,7 +132,13 @@ def fetch_batch(conn, ids, evaluator, board_size, max_walls, max_steps):
         current_player = int(game.current_player)
 
         mcts_policy = build_policy_from_children(
-            conn, state_bytes, current_player, board_size, max_walls, max_steps, num_actions,
+            conn,
+            state_bytes,
+            current_player,
+            board_size,
+            max_walls,
+            max_steps,
+            num_actions,
         )
         if mcts_policy is None:
             continue
@@ -171,6 +177,7 @@ def compute_accuracy(test_ids, conn, evaluator, board_size, max_walls, max_steps
 
     correct = 0
     total = 0
+    inaccurate_printed = 0
     evaluator.network.eval()
     device = evaluator.device
     with torch.no_grad():
@@ -214,6 +221,16 @@ def compute_accuracy(test_ids, conn, evaluator, board_size, max_walls, max_steps
             model_pick = np.argmax(model_vals) if current_player == 0 else np.argmin(model_vals)
             if db_vals[model_pick] == best_db_val:
                 correct += 1
+            else:
+                if inaccurate_printed < 3:
+                    inaccurate_printed += 1
+                    print(f"  Inaccurate state {inaccurate_printed}:")
+                    print(quoridor_rs.compact_state_display(state_bytes, board_size, max_walls, max_steps))
+                    print(f"    DB values:    {db_vals}")
+                    print(f"    Model values: {model_vals.tolist()}")
+                    print(
+                        f"    Best DB val: {best_db_val}, model picked child {model_pick} (DB val: {db_vals[model_pick]})"
+                    )
             total += 1
 
     return correct / total if total > 0 else float("nan")
@@ -351,15 +368,17 @@ def main():
     print(f"Feature dim: {feature_dim}")
 
     if use_wandb:
-        wandb.config.update({
-            "board_size": board_size,
-            "max_walls": max_walls,
-            "max_steps": max_steps,
-            "num_states": num_states,
-            "train_size": num_states - test_size,
-            "test_size": len(test_samples),
-            "feature_dim": feature_dim,
-        })
+        wandb.config.update(
+            {
+                "board_size": board_size,
+                "max_walls": max_walls,
+                "max_steps": max_steps,
+                "num_states": num_states,
+                "train_size": num_states - test_size,
+                "test_size": len(test_samples),
+                "feature_dim": feature_dim,
+            }
+        )
 
     # ------------------------------------------------------------------
     # Training loop
@@ -367,7 +386,26 @@ def main():
     best_test_loss = float("inf")
     batch_size = az_params.batch_size
 
+    learning_rate = az_params.learning_rate
+    wandb.log(
+        {
+            "learning_rate": learning_rate,
+            "step": 0,
+        }
+    )
+
     for step in range(1, args.num_steps + 1):
+        if step % 100000 == 0:
+            learning_rate = learning_rate / 2.0
+            print(f"Lowering learning rate to {learning_rate}")
+            evaluator.train_prepare(learning_rate, az_params.batch_size, args.num_steps, az_params.weight_decay)
+            wandb.log(
+                {
+                    "learning_rate": learning_rate,
+                    "step": step,
+                }
+            )
+
         # Oversample to account for player filtering and states dropped by
         # build_policy_from_children (missing children in DB).
         oversample = 4 if test_player is None else 8
@@ -381,18 +419,22 @@ def main():
         train_policy_loss, train_value_loss, train_total_loss = evaluator.train_iteration_v2(batch_samples)
 
         if use_wandb:
-            wandb.log({
-                "train/value_loss": train_value_loss,
-                "train/policy_loss": train_policy_loss,
-                "train/total_loss": train_total_loss,
-                "step": step,
-            })
+            wandb.log(
+                {
+                    "train/value_loss": train_value_loss,
+                    "train/policy_loss": train_policy_loss,
+                    "train/total_loss": train_total_loss,
+                    "step": step,
+                }
+            )
 
         if step % args.log_interval == 0 or step == 1:
             evaluator.network.eval()
             with torch.no_grad():
                 test_policy_loss, test_value_loss, test_total_loss = evaluator.compute_losses(test_samples)
-            test_loss = test_value_loss.item()
+                test_policy_loss = test_policy_loss.item()
+                test_value_loss = test_value_loss.item()
+                test_total_loss = test_total_loss.item()
             evaluator.network.train()
 
             acc = compute_accuracy(
@@ -407,21 +449,23 @@ def main():
             )
 
             print(
-                f"step {step:6d} | train_loss {train_value_loss:.4f} | test_loss {test_loss:.4f} | accuracy {acc:.3f}"
+                f"step {step:6d} | train_loss {train_total_loss:.4f} | test_loss {test_total_loss:.4f} | accuracy {acc:.3f}"
             )
             sys.stdout.flush()
 
             if use_wandb:
-                wandb.log({
-                    "test/value_loss": test_loss,
-                    "test/policy_loss": test_policy_loss.item(),
-                    "test/total_loss": test_total_loss.item(),
-                    "test/accuracy": acc,
-                    "step": step,
-                })
+                wandb.log(
+                    {
+                        "test/value_loss": test_value_loss,
+                        "test/policy_loss": test_policy_loss,
+                        "test/total_loss": test_total_loss,
+                        "test/accuracy": acc,
+                        "step": step,
+                    }
+                )
 
-            if test_loss < best_test_loss:
-                best_test_loss = test_loss
+            if test_total_loss < best_test_loss:
+                best_test_loss = test_total_loss
                 torch.save(
                     {
                         "network_state_dict": evaluator.network.state_dict(),

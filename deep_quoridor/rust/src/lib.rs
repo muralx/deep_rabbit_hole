@@ -550,6 +550,20 @@ fn get_compact_child_states(
     children
 }
 
+/// Return a text-art display string for a compact state.
+#[cfg(feature = "python")]
+#[pyfunction]
+fn compact_state_display(
+    state: &[u8],
+    board_size: usize,
+    max_walls: usize,
+    max_steps: usize,
+) -> String {
+    use compact::q_bit_repr::QBitRepr;
+    let repr = QBitRepr::new(board_size, max_walls, max_steps);
+    repr.display(state)
+}
+
 /// A Python module implemented in Rust.
 #[cfg(feature = "python")]
 #[pymodule]
@@ -588,6 +602,7 @@ fn quoridor_rs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Compact state utilities for training
     m.add_function(wrap_pyfunction!(compact_state_to_game_state, m)?)?;
     m.add_function(wrap_pyfunction!(get_compact_child_states, m)?)?;
+    m.add_function(wrap_pyfunction!(compact_state_display, m)?)?;
 
     // Export constants to match qgrid.py
     m.add("CELL_FREE", grid::CELL_FREE)?;
