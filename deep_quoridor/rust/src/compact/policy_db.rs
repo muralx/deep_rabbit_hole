@@ -54,16 +54,50 @@ pub type TranspositionTable = DashMap<StateKey, i8>;
 /// SQLite-backed policy database for storing and querying pre-computed minimax values.
 pub struct PolicyDb {
     conn: Connection,
+    mechanics: QGameMechanics,
 }
 
 impl PolicyDb {
     /// Open an existing policy database for reading.
+    ///
+    /// Reads metadata to initialize game mechanics for state interpretation.
     pub fn open(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let conn = Connection::open_with_flags(
             Path::new(path),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        Ok(Self { conn })
+
+        // Read metadata to create mechanics.
+        let mut stmt = conn.prepare("SELECT key, value FROM metadata")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?;
+        let mut board_size = None;
+        let mut max_walls = None;
+        let mut max_steps = None;
+        for row in rows {
+            let (key, value) = row?;
+            match key.as_str() {
+                "board_size" => board_size = Some(value as usize),
+                "max_walls" => max_walls = Some(value as usize),
+                "max_steps" => max_steps = Some(value as usize),
+                _ => {}
+            }
+        }
+        drop(stmt);
+
+        let mechanics = QGameMechanics::new(
+            board_size.ok_or("missing board_size in metadata")?,
+            max_walls.ok_or("missing max_walls in metadata")?,
+            max_steps.ok_or("missing max_steps in metadata")?,
+        );
+
+        Ok(Self { conn, mechanics })
+    }
+
+    /// Get a reference to the game mechanics.
+    pub fn mechanics(&self) -> &QGameMechanics {
+        &self.mechanics
     }
 
     /// Look up values for all actions reachable from the given state.
@@ -73,9 +107,9 @@ impl PolicyDb {
     /// player's perspective (positive = good for the acting player).
     pub fn lookup_action_values(
         &self,
-        mechanics: &QGameMechanics,
         data: &[u8],
     ) -> Result<Option<(Vec<(u8, u8, u8)>, Vec<i32>)>, Box<dyn std::error::Error>> {
+        let mechanics = &self.mechanics;
         let cp = mechanics.repr().get_current_player(data);
 
         let mut data_mut = data.to_vec();
@@ -155,6 +189,88 @@ impl PolicyDb {
         }
 
         Ok(Some((actions, values)))
+    }
+
+    /// Read metadata from the database.
+    ///
+    /// Returns `(board_size, max_walls, max_steps, num_states)` where
+    /// `num_states` is `None` if not present in the metadata table.
+    pub fn read_metadata(&self) -> Result<(usize, usize, usize, Option<usize>), Box<dyn std::error::Error>> {
+        let mut stmt = self.conn.prepare("SELECT key, value FROM metadata")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?;
+
+        let mut board_size = None;
+        let mut max_walls = None;
+        let mut max_steps = None;
+        let mut num_states = None;
+
+        for row in rows {
+            let (key, value) = row?;
+            match key.as_str() {
+                "board_size" => board_size = Some(value as usize),
+                "max_walls" => max_walls = Some(value as usize),
+                "max_steps" => max_steps = Some(value as usize),
+                "num_states" => num_states = Some(value as usize),
+                _ => {}
+            }
+        }
+
+        Ok((
+            board_size.ok_or("missing board_size in metadata")?,
+            max_walls.ok_or("missing max_walls in metadata")?,
+            max_steps.ok_or("missing max_steps in metadata")?,
+            num_states,
+        ))
+    }
+
+    /// Count the total number of states in the policy table.
+    pub fn count_states(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM policy", [], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
+    /// Fetch states and values by rowid.
+    ///
+    /// Returns a list of `(state_bytes, value)` tuples for each found rowid.
+    pub fn fetch_states_by_rowid(&self, rowids: &[i64]) -> Result<Vec<(Vec<u8>, i32)>, Box<dyn std::error::Error>> {
+        if rowids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: String = std::iter::repeat("?").take(rowids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT state, value FROM policy WHERE rowid IN ({})", placeholders);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(rowids.iter()), |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i32>(1)?))
+        })?;
+        let mut results = Vec::with_capacity(rowids.len());
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Look up values for the given state blobs.
+    ///
+    /// Returns a list of `(state_bytes, value)` for each state found in the DB.
+    /// States not present in the DB are omitted from the result.
+    pub fn lookup_values_by_state(&self, states: &[&[u8]]) -> Result<Vec<(Vec<u8>, i32)>, Box<dyn std::error::Error>> {
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: String = std::iter::repeat("?").take(states.len()).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT state, value FROM policy WHERE state IN ({})", placeholders);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = states.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i32>(1)?))
+        })?;
+        let mut results = Vec::with_capacity(states.len());
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
     }
 
     /// Create a new policy database from a transposition table.

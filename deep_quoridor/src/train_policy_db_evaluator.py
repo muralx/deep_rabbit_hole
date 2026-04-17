@@ -15,7 +15,6 @@ Two metrics are logged during training:
 import argparse
 import os
 import random
-import sqlite3
 import sys
 from dataclasses import asdict
 
@@ -31,16 +30,6 @@ from utils.subargs import parse_subargs
 # ---------------------------------------------------------------------------
 # Data helpers
 # ---------------------------------------------------------------------------
-
-
-def read_metadata(conn):
-    rows = conn.execute("SELECT key, value FROM metadata").fetchall()
-    meta = {k: v for k, v in rows}
-    board_size = int(meta["board_size"])
-    max_walls = int(meta["max_walls"])
-    max_steps = int(meta["max_steps"])
-    num_states = int(meta["num_states"]) if "num_states" in meta else None
-    return board_size, max_walls, max_steps, num_states
 
 
 def compact_state_to_game(state_bytes, board_size, max_walls, max_steps):
@@ -71,59 +60,41 @@ def child_action_index(row, col, action_type, board_size):
     raise ValueError(f"Unknown action_type {action_type}")
 
 
-def build_policy_from_children(conn, state_bytes, current_player, board_size, max_walls, max_steps, num_actions):
-    """Build a policy vector from DB child state values.
+def build_policy_from_action_values(db, state_bytes, board_size, num_actions):
+    """Build a policy vector from DB action values.
 
-    Finds the optimal child value (max for P0, min for P1) and assigns
-    uniform probability across all actions that achieve that value.
-    All other actions get zero probability.
+    Uses lookup_action_values which correctly handles terminal child states.
+    Assigns uniform probability across all actions with the best value
+    (values are from acting player's perspective, so best = max).
 
-    Returns the policy array, or None if some children are missing from the DB.
+    Returns the policy array, or None if no valid actions.
     """
-    children = quoridor_rs.get_compact_child_states(state_bytes, board_size, max_walls, max_steps)
-    if not children:
+    result = db.lookup_action_values(state_bytes)
+    if result is None:
         return None
 
-    child_blobs = [bytes(c[3]) for c in children]
-    placeholders = ",".join("?" * len(child_blobs))
-    child_rows = conn.execute(
-        f"SELECT state, value FROM policy WHERE state IN ({placeholders})",
-        child_blobs,
-    ).fetchall()
-    if len(child_rows) != len(child_blobs):
-        return None  # Some children not in DB.
-    child_db_vals = {bytes(s): v for s, v in child_rows}
+    actions, values = result
+    best_value = max(values)
 
-    # Find optimal value from current player's perspective.
-    child_values = [child_db_vals[bytes(c[3])] for c in children]
-    best_value = max(child_values) if current_player == 0 else min(child_values)
-
-    # Assign equal probability to all actions achieving the best value.
     policy = np.zeros(num_actions, dtype=np.float32)
-    for row, col, action_type, child_state in children:
-        if child_db_vals[bytes(child_state)] == best_value:
+    for (row, col, action_type), value in zip(actions, values):
+        if value == best_value:
             idx = child_action_index(row, col, action_type, board_size)
             policy[idx] = 1.0
     policy /= policy.sum()
     return policy
 
 
-def fetch_batch(conn, ids, evaluator, board_size, max_walls, max_steps):
+def fetch_batch(db, ids, evaluator, board_size, max_walls, max_steps):
     """Fetch rows by rowid from the policy table and compute features on the fly.
 
     Returns a list of sample dicts compatible with NNEvaluator.compute_losses.
     Each dict has keys: input_array, value, action_mask, mcts_policy, current_player.
 
-    mcts_policy is derived from the DB values of child states: uniform over
-    actions that lead to the optimal child value (max for P0, min for P1),
-    zero for all others. States whose children are not all present in the
-    DB are skipped.
+    mcts_policy is derived from lookup_action_values: uniform over actions
+    with the best value, zero for all others.
     """
-    placeholders = ",".join("?" * len(ids))
-    rows = conn.execute(
-        f"SELECT state, value FROM policy WHERE rowid IN ({placeholders})",
-        ids,
-    ).fetchall()
+    rows = db.fetch_states_by_rowid(ids)
     num_actions = evaluator.action_encoder.num_actions
     samples = []
     for state, value in rows:
@@ -131,13 +102,10 @@ def fetch_batch(conn, ids, evaluator, board_size, max_walls, max_steps):
         game = compact_state_to_game(state_bytes, board_size, max_walls, max_steps)
         current_player = int(game.current_player)
 
-        mcts_policy = build_policy_from_children(
-            conn,
+        mcts_policy = build_policy_from_action_values(
+            db,
             state_bytes,
-            current_player,
             board_size,
-            max_walls,
-            max_steps,
             num_actions,
         )
         if mcts_policy is None:
@@ -161,7 +129,7 @@ def fetch_batch(conn, ids, evaluator, board_size, max_walls, max_steps):
 # ---------------------------------------------------------------------------
 
 
-def compute_accuracy(test_ids, conn, evaluator, board_size, max_walls, max_steps, num_samples, test_player=None):
+def compute_accuracy(test_ids, db, evaluator, board_size, max_walls, max_steps, num_samples, test_player=None):
     """Fraction of sampled states where model picks the same best child as DB.
 
     If test_player is 0 or 1, only states where the current player matches are counted.
@@ -169,11 +137,7 @@ def compute_accuracy(test_ids, conn, evaluator, board_size, max_walls, max_steps
     sample_ids = random.sample(test_ids, min(num_samples, len(test_ids)))
 
     # Fetch the state blobs and values for the sampled test IDs.
-    placeholders = ",".join("?" * len(sample_ids))
-    rows = conn.execute(
-        f"SELECT state, value FROM policy WHERE rowid IN ({placeholders})",
-        sample_ids,
-    ).fetchall()
+    rows = db.fetch_states_by_rowid(sample_ids)
 
     correct = 0
     total = 0
@@ -190,46 +154,41 @@ def compute_accuracy(test_ids, conn, evaluator, board_size, max_walls, max_steps
             if test_player is not None and current_player != test_player:
                 continue
 
-            children = quoridor_rs.get_compact_child_states(state_bytes, board_size, max_walls, max_steps)
-            if not children:
+            # DB action values (handles terminal child states correctly).
+            # Values are from the acting player's perspective (positive = good).
+            result = db.lookup_action_values(state_bytes)
+            if result is None:
                 continue
+            _actions, db_action_vals = result
+            db_action_vals = list(db_action_vals)
 
-            child_blobs = [bytes(c[3]) for c in children]
-
-            # Look up DB values for all children via the state index.
-            child_placeholders = ",".join("?" * len(child_blobs))
-            child_rows = conn.execute(
-                f"SELECT state, value FROM policy WHERE state IN ({child_placeholders})",
-                child_blobs,
-            ).fetchall()
-            if len(child_rows) != len(child_blobs):
-                continue  # Some children not in DB (e.g. terminal states).
-            child_db_vals = {bytes(s): v for s, v in child_rows}
-            db_vals = [child_db_vals[cb] for cb in child_blobs]
-
-            # Model predictions for children.
+            # Model predictions for children (same action ordering as lookup_action_values).
+            children = quoridor_rs.get_compact_child_states(state_bytes, board_size, max_walls, max_steps)
             child_features = []
-            for cb in child_blobs:
-                child_game = compact_state_to_game(cb, board_size, max_walls, max_steps)
+            for _row, _col, _action_type, child_state in children:
+                child_game = compact_state_to_game(bytes(child_state), board_size, max_walls, max_steps)
                 child_features.append(evaluator.game_to_input_array(child_game))
             x = torch.tensor(np.stack(child_features), dtype=torch.float32, device=device)
             _, model_vals = evaluator.network(x)
+            # Model predicts P0-absolute values; convert to acting player's perspective.
             model_vals = model_vals.squeeze(-1).cpu().numpy()
+            if current_player == 1:
+                model_vals = -model_vals
 
-            # The model's pick is correct if it leads to a child with the best DB value.
-            best_db_val = max(db_vals) if current_player == 0 else min(db_vals)
-            model_pick = np.argmax(model_vals) if current_player == 0 else np.argmin(model_vals)
-            if db_vals[model_pick] == best_db_val:
+            # DB action values and model values are both from acting player's perspective.
+            best_db_val = max(db_action_vals)
+            model_pick = int(np.argmax(model_vals))
+            if db_action_vals[model_pick] == best_db_val:
                 correct += 1
             else:
                 if inaccurate_printed < 3:
                     inaccurate_printed += 1
                     print(f"  Inaccurate state {inaccurate_printed}:")
                     print(quoridor_rs.compact_state_display(state_bytes, board_size, max_walls, max_steps))
-                    print(f"    DB values:    {db_vals}")
+                    print(f"    DB values:    {db_action_vals}")
                     print(f"    Model values: {model_vals.tolist()}")
                     print(
-                        f"    Best DB val: {best_db_val}, model picked child {model_pick} (DB val: {db_vals[model_pick]})"
+                        f"    Best DB val: {best_db_val}, model picked child {model_pick} (DB val: {db_action_vals[model_pick]})"
                     )
             total += 1
 
@@ -322,13 +281,13 @@ def main():
     # ------------------------------------------------------------------
     # Open DB and read metadata
     # ------------------------------------------------------------------
-    conn = sqlite3.connect(args.db_path)
-    board_size, max_walls, max_steps, num_states = read_metadata(conn)
+    db = quoridor_rs.PyPolicyDb(args.db_path)
+    board_size, max_walls, max_steps, num_states = db.read_metadata()
     print(f"Board size: {board_size}, max_walls: {max_walls}, max_steps: {max_steps}")
 
     if num_states is None:
         # Fallback for DBs created before autoincrement ID was added.
-        num_states = conn.execute("SELECT COUNT(*) FROM policy").fetchone()[0]
+        num_states = db.count_states()
         print(f"(num_states not in metadata, counted {num_states} rows)")
     print(f"Policy DB contains {num_states} states")
 
@@ -357,7 +316,7 @@ def main():
     # Pre-compute test samples (test set is small / capped)
     # ------------------------------------------------------------------
     print("Computing test features...")
-    test_samples = fetch_batch(conn, test_ids, evaluator, board_size, max_walls, max_steps)
+    test_samples = fetch_batch(db, test_ids, evaluator, board_size, max_walls, max_steps)
 
     # Filter test set by player if requested.
     if test_player is not None:
@@ -412,7 +371,7 @@ def main():
         batch_ids = random.sample(range(1, num_states + 1), min(batch_size * oversample, num_states))
         if args.exclude_test_set:
             batch_ids = [i for i in batch_ids if i not in test_id_set]
-        batch_samples = fetch_batch(conn, batch_ids, evaluator, board_size, max_walls, max_steps)
+        batch_samples = fetch_batch(db, batch_ids, evaluator, board_size, max_walls, max_steps)
         if test_player is not None:
             batch_samples = [s for s in batch_samples if s["current_player"] == test_player]
         batch_samples = batch_samples[:batch_size]
@@ -439,7 +398,7 @@ def main():
 
             acc = compute_accuracy(
                 test_ids,
-                conn,
+                db,
                 evaluator,
                 board_size,
                 max_walls,
@@ -477,7 +436,6 @@ def main():
                     args.output,
                 )
 
-    conn.close()
     print(f"Training complete. Best test loss: {best_test_loss:.4f}. Model saved to {args.output}")
 
     if use_wandb:

@@ -409,18 +409,18 @@ fn policy_db_lookup<'py>(
     walls_remaining: PyReadonlyArray1<i32>,
     current_player: i32,
     completed_steps: i32,
-    board_size: usize,
-    max_walls: usize,
-    max_steps: usize,
+    _board_size: usize,
+    _max_walls: usize,
+    _max_steps: usize,
     db_path: &str,
 ) -> PyResult<Option<(Bound<'py, PyArray2<i32>>, Bound<'py, numpy::PyArray1<i32>>)>> {
     use compact::policy_db::PolicyDb;
-    use compact::q_game_mechanics::QGameMechanics;
 
-    let mechanics = QGameMechanics::new(board_size, max_walls, max_steps);
+    let db = PolicyDb::open(db_path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to open DB: {e}")))?;
 
-    let mut data = mechanics.repr().create_data();
-    mechanics.repr().from_game_state(
+    let mut data = db.mechanics().repr().create_data();
+    db.mechanics().repr().from_game_state(
         &mut data,
         &grid.as_array(),
         &player_positions.as_array(),
@@ -429,11 +429,8 @@ fn policy_db_lookup<'py>(
         completed_steps,
     );
 
-    let db = PolicyDb::open(db_path)
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to open DB: {e}")))?;
-
     match db
-        .lookup_action_values(&mechanics, &data)
+        .lookup_action_values(&data)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("DB query error: {e}")))?
     {
         None => Ok(None),
@@ -550,6 +547,59 @@ fn get_compact_child_states(
     children
 }
 
+/// Python wrapper around PolicyDb for database access from Python.
+#[cfg(feature = "python")]
+#[pyclass]
+struct PyPolicyDb {
+    db: compact::policy_db::PolicyDb,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PyPolicyDb {
+    #[new]
+    fn new(path: &str) -> PyResult<Self> {
+        let db = compact::policy_db::PolicyDb::open(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to open DB: {e}")))?;
+        Ok(Self { db })
+    }
+
+    /// Read metadata: returns (board_size, max_walls, max_steps, num_states).
+    fn read_metadata(&self) -> PyResult<(usize, usize, usize, Option<usize>)> {
+        self.db.read_metadata()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+    }
+
+    /// Count total states in the policy table.
+    fn count_states(&self) -> PyResult<usize> {
+        self.db.count_states()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+    }
+
+    /// Fetch (state_bytes, value) tuples by rowid.
+    fn fetch_states_by_rowid(&self, rowids: Vec<i64>) -> PyResult<Vec<(Vec<u8>, i32)>> {
+        self.db.fetch_states_by_rowid(&rowids)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+    }
+
+    /// Look up (state_bytes, value) for the given state blobs.
+    fn lookup_values_by_state(&self, states: Vec<Vec<u8>>) -> PyResult<Vec<(Vec<u8>, i32)>> {
+        let refs: Vec<&[u8]> = states.iter().map(|s| s.as_slice()).collect();
+        self.db.lookup_values_by_state(&refs)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+    }
+
+    /// Look up action values for a compact state.
+    ///
+    /// Returns None if no valid actions, otherwise returns
+    /// (actions, values) where actions is a list of (row, col, action_type)
+    /// and values are from the acting player's perspective.
+    fn lookup_action_values(&self, state: Vec<u8>) -> PyResult<Option<(Vec<(u8, u8, u8)>, Vec<i32>)>> {
+        self.db.lookup_action_values(&state)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+    }
+}
+
 /// Return a text-art display string for a compact state.
 #[cfg(feature = "python")]
 #[pyfunction]
@@ -603,6 +653,9 @@ fn quoridor_rs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compact_state_to_game_state, m)?)?;
     m.add_function(wrap_pyfunction!(get_compact_child_states, m)?)?;
     m.add_function(wrap_pyfunction!(compact_state_display, m)?)?;
+
+    // PolicyDb class
+    m.add_class::<PyPolicyDb>()?;
 
     // Export constants to match qgrid.py
     m.add("CELL_FREE", grid::CELL_FREE)?;
