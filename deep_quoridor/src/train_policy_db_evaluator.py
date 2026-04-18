@@ -143,54 +143,50 @@ def compute_accuracy(test_ids, db, evaluator, board_size, max_walls, max_steps, 
     total = 0
     inaccurate_printed = 0
     evaluator.network.eval()
-    device = evaluator.device
-    with torch.no_grad():
-        for state_blob, _value in rows:
-            state_bytes = bytes(state_blob)
-            game = compact_state_to_game(state_bytes, board_size, max_walls, max_steps)
-            current_player = int(game.current_player)
+    for state_blob, _value in rows:
+        state_bytes = bytes(state_blob)
+        game = compact_state_to_game(state_bytes, board_size, max_walls, max_steps)
+        current_player = int(game.current_player)
 
-            # Filter by player if requested.
-            if test_player is not None and current_player != test_player:
-                continue
+        # Filter by player if requested.
+        if test_player is not None and current_player != test_player:
+            continue
 
-            # DB action values (handles terminal child states correctly).
-            # Values are from the acting player's perspective (positive = good).
-            result = db.lookup_action_values(state_bytes)
-            assert result is not None
+        # DB action values (handles terminal child states correctly).
+        # Values are from the acting player's perspective (positive = good).
+        result = db.lookup_action_values(state_bytes)
+        assert result is not None
 
-            _actions, db_action_vals = result
-            db_action_vals = list(db_action_vals)
+        _actions, db_action_vals = result
+        db_action_vals = list(db_action_vals)
 
-            # Model predictions for children (same action ordering as lookup_action_values).
-            children = quoridor_rs.get_compact_child_states(state_bytes, board_size, max_walls, max_steps)
-            child_features = []
-            for _row, _col, _action_type, child_state in children:
-                child_game = compact_state_to_game(bytes(child_state), board_size, max_walls, max_steps)
-                child_features.append(evaluator.game_to_input_array(child_game))
-            x = torch.tensor(np.stack(child_features), dtype=torch.float32, device=device)
-            _, model_vals = evaluator.network(x)
-            # Model predicts P0-absolute values; convert to acting player's perspective.
-            model_vals = model_vals.squeeze(-1).cpu().numpy()
-            if current_player == 1:
-                model_vals = -model_vals
+        # Model predictions for children (same action ordering as lookup_action_values).
+        children = quoridor_rs.get_compact_child_states(state_bytes, board_size, max_walls, max_steps)
+        child_games = [
+            compact_state_to_game(bytes(child_state), board_size, max_walls, max_steps)
+            for _row, _col, _action_type, child_state in children
+        ]
+        # evaluate_batch returns values from the child's current player's perspective
+        # (i.e. the opponent). Negate to get acting player's perspective.
+        child_values, _ = evaluator.evaluate_batch(child_games)
+        model_vals = [-v for v in child_values]
 
-            # DB action values and model values are both from acting player's perspective.
-            best_db_val = max(db_action_vals)
-            model_pick = int(np.argmax(model_vals))
-            if db_action_vals[model_pick] == best_db_val:
-                correct += 1
-            else:
-                if inaccurate_printed < 3:
-                    inaccurate_printed += 1
-                    print(f"  Inaccurate state {inaccurate_printed}:")
-                    print(quoridor_rs.compact_state_display(state_bytes, board_size, max_walls, max_steps))
-                    print(f"    DB values:    {db_action_vals}")
-                    print(f"    Model values: {model_vals.tolist()}")
-                    print(
-                        f"    Best DB val: {best_db_val}, model picked child {model_pick} (DB val: {db_action_vals[model_pick]})"
-                    )
-            total += 1
+        # DB action values and model values are both from acting player's perspective.
+        best_db_val = max(db_action_vals)
+        model_pick = int(np.argmax(model_vals))
+        if db_action_vals[model_pick] == best_db_val:
+            correct += 1
+        else:
+            if inaccurate_printed < 3:
+                inaccurate_printed += 1
+                print(f"  Inaccurate state {inaccurate_printed}:")
+                print(quoridor_rs.compact_state_display(state_bytes, board_size, max_walls, max_steps))
+                print(f"    DB values:    {db_action_vals}")
+                print(f"    Model values: {model_vals}")
+                print(
+                    f"    Best DB val: {best_db_val}, model picked child {model_pick} (DB val: {db_action_vals[model_pick]})"
+                )
+        total += 1
 
     return correct / total
 
@@ -309,7 +305,7 @@ def main():
     # Create NNEvaluator and set up optimizer
     # ------------------------------------------------------------------
     action_encoder = ActionEncoder(board_size)
-    evaluator = NNEvaluator(action_encoder, device, nn_config, max_cache_size=0)
+    evaluator = NNEvaluator(action_encoder, device, nn_config, max_cache_size=1000)
     evaluator.train_prepare(az_params.learning_rate, az_params.batch_size, args.num_steps, az_params.weight_decay)
 
     # ------------------------------------------------------------------
