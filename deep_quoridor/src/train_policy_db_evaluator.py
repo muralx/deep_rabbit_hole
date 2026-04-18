@@ -70,8 +70,7 @@ def build_policy_from_action_values(db, state_bytes, board_size, num_actions):
     Returns the policy array, or None if no valid actions.
     """
     result = db.lookup_action_values(state_bytes)
-    if result is None:
-        return None
+    assert result is not None
 
     actions, values = result
     best_value = max(values)
@@ -108,8 +107,7 @@ def fetch_batch(db, ids, evaluator, board_size, max_walls, max_steps):
             board_size,
             num_actions,
         )
-        if mcts_policy is None:
-            continue
+        assert mcts_policy is not None
 
         action_mask = game.get_action_mask().astype(np.float32)
         samples.append(
@@ -134,6 +132,8 @@ def compute_accuracy(test_ids, db, evaluator, board_size, max_walls, max_steps, 
 
     If test_player is 0 or 1, only states where the current player matches are counted.
     """
+    assert len(test_ids) > 0
+    assert num_samples > 0
     sample_ids = random.sample(test_ids, min(num_samples, len(test_ids)))
 
     # Fetch the state blobs and values for the sampled test IDs.
@@ -157,8 +157,8 @@ def compute_accuracy(test_ids, db, evaluator, board_size, max_walls, max_steps, 
             # DB action values (handles terminal child states correctly).
             # Values are from the acting player's perspective (positive = good).
             result = db.lookup_action_values(state_bytes)
-            if result is None:
-                continue
+            assert result is not None
+
             _actions, db_action_vals = result
             db_action_vals = list(db_action_vals)
 
@@ -192,7 +192,7 @@ def compute_accuracy(test_ids, db, evaluator, board_size, max_walls, max_steps, 
                     )
             total += 1
 
-    return correct / total if total > 0 else float("nan")
+    return correct / total
 
 
 # ---------------------------------------------------------------------------
@@ -346,24 +346,26 @@ def main():
     batch_size = az_params.batch_size
 
     learning_rate = az_params.learning_rate
-    wandb.log(
-        {
-            "learning_rate": learning_rate,
-            "step": 0,
-        }
-    )
+    if use_wandb:
+        wandb.log(
+            {
+                "learning_rate": learning_rate,
+                "step": 0,
+            }
+        )
 
     for step in range(1, args.num_steps + 1):
         if step % 100000 == 0:
             learning_rate = learning_rate / 2.0
             print(f"Lowering learning rate to {learning_rate}")
             evaluator.train_prepare(learning_rate, az_params.batch_size, args.num_steps, az_params.weight_decay)
-            wandb.log(
-                {
-                    "learning_rate": learning_rate,
-                    "step": step,
-                }
-            )
+            if use_wandb:
+                wandb.log(
+                    {
+                        "learning_rate": learning_rate,
+                        "step": step,
+                    }
+                )
 
         # Oversample to account for player filtering and states dropped by
         # build_policy_from_children (missing children in DB).
