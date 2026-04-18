@@ -113,7 +113,7 @@ def fetch_batch(db, ids, evaluator, board_size, max_walls, max_steps):
         samples.append(
             {
                 "input_array": evaluator.game_to_input_array(game),
-                "value": value,
+                "value": value if current_player == 0 else -value,
                 "action_mask": action_mask,
                 "mcts_policy": mcts_policy,
                 "current_player": current_player,
