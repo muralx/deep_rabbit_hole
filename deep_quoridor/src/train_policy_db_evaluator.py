@@ -27,6 +27,23 @@ from agents.alphazero.nn_evaluator import NNConfig, NNEvaluator
 from quoridor import ActionEncoder, Board, Player, Quoridor
 from utils.subargs import parse_subargs
 
+DEBUG = True
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+
+def print_policy(policy, action_encoder):
+    """Print non-zero entries of a policy array as human-readable actions."""
+    nonzero = np.nonzero(policy)[0]
+    parts = []
+    for idx in nonzero:
+        action = action_encoder.index_to_action(idx)
+        parts.append(f"{action}: {policy[idx]:.3f}")
+    print("  ".join(parts))
+
+
 # ---------------------------------------------------------------------------
 # Data helpers
 # ---------------------------------------------------------------------------
@@ -84,7 +101,7 @@ def build_policy_from_action_values(db, state_bytes, board_size, num_actions):
     return policy
 
 
-def fetch_batch(db, ids, evaluator, board_size, max_walls, max_steps):
+def fetch_batch(db, ids, evaluator: NNEvaluator, board_size, max_walls, max_steps):
     """Fetch rows by rowid from the policy table and compute features on the fly.
 
     Returns a list of sample dicts compatible with NNEvaluator.compute_losses.
@@ -109,10 +126,21 @@ def fetch_batch(db, ids, evaluator, board_size, max_walls, max_steps):
         )
         assert mcts_policy is not None
 
-        action_mask = game.get_action_mask().astype(np.float32)
+        # Do the rotation, in the same way AlphaZeroAgent.store_training_data() does
+        game, is_rotated = evaluator.rotate_if_needed_to_point_downwards(game)
+        input_array = evaluator.game_to_input_array(game)
+        action_mask = game.get_action_mask()
+        if is_rotated:
+            mcts_policy = evaluator.rotate_policy_from_original(mcts_policy)
+
+        if DEBUG:
+            print("")
+            print(game)
+            print_policy(mcts_policy, evaluator.action_encoder)
+
         samples.append(
             {
-                "input_array": evaluator.game_to_input_array(game),
+                "input_array": input_array,
                 "value": value if current_player == 0 else -value,
                 "action_mask": action_mask,
                 "mcts_policy": mcts_policy,
@@ -177,7 +205,7 @@ def compute_accuracy(test_ids, db, evaluator, board_size, max_walls, max_steps, 
         if db_action_vals[model_pick] == best_db_val:
             correct += 1
         else:
-            if inaccurate_printed < 3:
+            if DEBUG and inaccurate_printed < 3:
                 inaccurate_printed += 1
                 print(f"  Inaccurate state {inaccurate_printed}:")
                 print(quoridor_rs.compact_state_display(state_bytes, board_size, max_walls, max_steps))

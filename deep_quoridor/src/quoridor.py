@@ -551,7 +551,15 @@ class Quoridor:
         )
 
     def __str__(self):
-        return str(self.board)
+        p1_walls = self.board.get_walls_remaining(Player.ONE)
+        p2_walls = self.board.get_walls_remaining(Player.TWO)
+        return (
+            f"{self.board}\n"
+            f"Current player: {self.current_player + 1}  |  "
+            f"Walls remaining: P1={p1_walls} P2={p2_walls}  |  "
+            f"Steps: {self.completed_steps} | "
+            f"Rotated: {self._rotated}"
+        )
 
     def get_fast_hash(self):
         # Use a fast, unique hash based on the board, player positions, walls, and current player.
