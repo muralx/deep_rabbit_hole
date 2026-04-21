@@ -27,7 +27,7 @@ from agents.alphazero.nn_evaluator import NNConfig, NNEvaluator
 from quoridor import ActionEncoder, Board, Player, Quoridor
 from utils.subargs import parse_subargs
 
-DEBUG = True
+DEBUG = False
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -51,7 +51,7 @@ def print_policy(policy, action_encoder):
 
 def compact_state_to_game(state_bytes, board_size, max_walls, max_steps):
     """Convert compact state bytes to a Quoridor game object."""
-    grid, player_positions, walls_remaining, old_style_walls, current_player, _completed_steps = (
+    grid, player_positions, walls_remaining, old_style_walls, current_player, completed_steps = (
         quoridor_rs.compact_state_to_game_state(state_bytes, board_size, max_walls, max_steps)
     )
     board = Board.from_arrays(
@@ -62,7 +62,7 @@ def compact_state_to_game(state_bytes, board_size, max_walls, max_steps):
         np.asarray(walls_remaining),
         np.asarray(old_style_walls),
     )
-    return Quoridor(board, Player(current_player))
+    return Quoridor(board, Player(current_player), completed_steps=completed_steps)
 
 
 def child_action_index(row, col, action_type, board_size):
@@ -333,7 +333,7 @@ def main():
     # Create NNEvaluator and set up optimizer
     # ------------------------------------------------------------------
     action_encoder = ActionEncoder(board_size)
-    evaluator = NNEvaluator(action_encoder, device, nn_config, max_cache_size=1000)
+    evaluator = NNEvaluator(action_encoder, device, nn_config, max_cache_size=100000)
     evaluator.train_prepare(az_params.learning_rate, az_params.batch_size, args.num_steps, az_params.weight_decay)
 
     # ------------------------------------------------------------------
@@ -434,7 +434,10 @@ def main():
             )
 
             print(
-                f"step {step:6d} | train_loss {train_total_loss:.4f} | test_loss {test_total_loss:.4f} | accuracy {acc:.3f}"
+                f"step {step:6d} | "
+                f"train: pol={train_policy_loss:.4f} val={train_value_loss:.4f} tot={train_total_loss:.4f} | "
+                f"test: pol={test_policy_loss:.4f} val={test_value_loss:.4f} tot={test_total_loss:.4f} | "
+                f"accuracy {acc:.3f}"
             )
             sys.stdout.flush()
 
