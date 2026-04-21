@@ -34,14 +34,14 @@ DEBUG = False
 # ---------------------------------------------------------------------------
 
 
-def print_policy(policy, action_encoder):
+def policy_to_str(policy, action_encoder):
     """Print non-zero entries of a policy array as human-readable actions."""
     nonzero = np.nonzero(policy)[0]
     parts = []
     for idx in nonzero:
         action = action_encoder.index_to_action(idx)
         parts.append(f"{action}: {policy[idx]:.3f}")
-    print("  ".join(parts))
+    return "  ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +117,9 @@ def fetch_batch(db, ids, evaluator: NNEvaluator, board_size, max_walls, max_step
         state_bytes = bytes(state)
         game = compact_state_to_game(state_bytes, board_size, max_walls, max_steps)
         current_player = int(game.current_player)
+        if current_player == 1:
+            # DB Values are always from P1 perspective
+            value = -value
 
         mcts_policy = build_policy_from_action_values(
             db,
@@ -124,7 +127,6 @@ def fetch_batch(db, ids, evaluator: NNEvaluator, board_size, max_walls, max_step
             board_size,
             num_actions,
         )
-        assert mcts_policy is not None
 
         # Do the rotation, in the same way AlphaZeroAgent.store_training_data() does
         game, is_rotated = evaluator.rotate_if_needed_to_point_downwards(game)
@@ -136,12 +138,14 @@ def fetch_batch(db, ids, evaluator: NNEvaluator, board_size, max_walls, max_step
         if DEBUG:
             print("")
             print(game)
-            print_policy(mcts_policy, evaluator.action_encoder)
+            print(f"Value: {value}")
+            print(f"Optimal actions: {policy_to_str(mcts_policy, evaluator.action_encoder)}")
+            print(f"Valid actions: {policy_to_str(action_mask, evaluator.action_encoder)}")
 
         samples.append(
             {
                 "input_array": input_array,
-                "value": value if current_player == 0 else -value,
+                "value": value,
                 "action_mask": action_mask,
                 "mcts_policy": mcts_policy,
                 "current_player": current_player,
@@ -155,8 +159,10 @@ def fetch_batch(db, ids, evaluator: NNEvaluator, board_size, max_walls, max_step
 # ---------------------------------------------------------------------------
 
 
-def compute_accuracy(test_ids, db, evaluator, board_size, max_walls, max_steps, num_samples, test_player=None):
-    """Fraction of sampled states where model picks the same best child as DB.
+def compute_accuracy(
+    test_ids, db, evaluator: NNEvaluator, board_size, max_walls, max_steps, num_samples, test_player=None
+):
+    """Fraction of sampled states where model picks the same best action as DB.
 
     If test_player is 0 or 1, only states where the current player matches are counted.
     """
@@ -170,50 +176,35 @@ def compute_accuracy(test_ids, db, evaluator, board_size, max_walls, max_steps, 
     correct = 0
     total = 0
     inaccurate_printed = 0
-    evaluator.network.eval()
     for state_blob, _value in rows:
         state_bytes = bytes(state_blob)
+
         game = compact_state_to_game(state_bytes, board_size, max_walls, max_steps)
         current_player = int(game.current_player)
-
-        # Filter by player if requested.
         if test_player is not None and current_player != test_player:
             continue
 
-        # DB action values (handles terminal child states correctly).
-        # Values are from the acting player's perspective (positive = good).
-        result = db.lookup_action_values(state_bytes)
-        assert result is not None
+        db_policy = build_policy_from_action_values(
+            db,
+            state_bytes,
+            board_size,
+            evaluator.action_encoder.num_actions,
+        )
 
-        _actions, db_action_vals = result
-        db_action_vals = list(db_action_vals)
+        _, model_policy = evaluator.evaluate(game)
 
-        # Model predictions for children (same action ordering as lookup_action_values).
-        children = quoridor_rs.get_compact_child_states(state_bytes, board_size, max_walls, max_steps)
-        child_games = [
-            compact_state_to_game(bytes(child_state), board_size, max_walls, max_steps)
-            for _row, _col, _action_type, child_state in children
-        ]
-        # evaluate_batch returns values from the child's current player's perspective
-        # (i.e. the opponent). Negate to get acting player's perspective.
-        child_values, _ = evaluator.evaluate_batch(child_games)
-        model_vals = [-v for v in child_values]
-
-        # DB action values and model values are both from acting player's perspective.
-        best_db_val = max(db_action_vals)
-        model_pick = int(np.argmax(model_vals))
-        if db_action_vals[model_pick] == best_db_val:
+        best_db_action_prob = max(db_policy)
+        model_pick = int(np.argmax(model_policy))
+        if db_policy[model_pick] == best_db_action_prob:
             correct += 1
         else:
-            if DEBUG and inaccurate_printed < 3:
+            if (DEBUG or True) and inaccurate_printed < 3:
                 inaccurate_printed += 1
-                print(f"  Inaccurate state {inaccurate_printed}:")
-                print(quoridor_rs.compact_state_display(state_bytes, board_size, max_walls, max_steps))
-                print(f"    DB values:    {db_action_vals}")
-                print(f"    Model values: {model_vals}")
-                print(
-                    f"    Best DB val: {best_db_val}, model picked child {model_pick} (DB val: {db_action_vals[model_pick]})"
-                )
+
+                print("")
+                print(game)
+                print(f"DB optimal actions: {policy_to_str(db_policy, evaluator.action_encoder)}")
+                print(f"Model optimal actions: {policy_to_str(model_policy, evaluator.action_encoder)}")
         total += 1
 
     return correct / total
