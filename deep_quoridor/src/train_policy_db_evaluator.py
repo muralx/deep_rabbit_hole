@@ -198,7 +198,7 @@ def compute_accuracy(
         if db_policy[model_pick] == best_db_action_prob:
             correct += 1
         else:
-            if (DEBUG or True) and inaccurate_printed < 3:
+            if DEBUG and inaccurate_printed < 3:
                 inaccurate_printed += 1
 
                 print("")
@@ -247,6 +247,12 @@ def parse_args():
         help="Exclude test set IDs from training batches (default: allow overlap)",
     )
     p.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Enable verbose debug output",
+    )
+    p.add_argument(
         "-w",
         "--wandb",
         nargs="?",
@@ -260,6 +266,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    global DEBUG
+    DEBUG = args.debug
 
     if args.device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
