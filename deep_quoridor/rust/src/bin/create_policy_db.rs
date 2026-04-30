@@ -35,8 +35,8 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     step_interval: usize,
 
-    /// Output SQLite database file path
-    #[arg(short, long, default_value = "policy_db.sqlite")]
+    /// Output Parquet database file path
+    #[arg(short, long, default_value = "policy_db.parquet")]
     output: String,
 }
 

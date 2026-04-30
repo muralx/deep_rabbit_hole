@@ -28,7 +28,8 @@ ndarray = "0.16"
 rand = "0.8"
 dashmap = "6"
 rayon = "1.10"
-rusqlite = { version = "0.32", features = ["bundled"] }
+arrow = "53"
+parquet = { version = "53", default-features = false, features = ["arrow", "zstd"] }
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4.5", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.11", optional = true }

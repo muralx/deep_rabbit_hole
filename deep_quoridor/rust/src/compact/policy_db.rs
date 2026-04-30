@@ -2,60 +2,149 @@
 ///
 /// Uses i8 values (1 = P0 wins, 0 = tie, -1 = P1 wins)
 /// with a transposition table.
+///
+/// Storage: Parquet file with two columns (`state`, `value`), sorted by
+/// `state`. The footer holds key/value metadata (board_size, max_walls,
+/// max_steps, num_states). Row-group min/max statistics on `state` are
+/// used to prune lookups; we never load the entire DB into memory.
+use std::collections::HashMap;
+use std::fs::File;
+use std::path::Path;
+use std::sync::Arc;
+
+use arrow::array::{Array, Int64Array, Int8Array, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use dashmap::DashMap;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::ArrowWriter;
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::WriterProperties;
+use parquet::file::statistics::Statistics;
+use parquet::format::KeyValue;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
-use rusqlite::{params, Connection};
-use std::path::Path;
 
 use super::q_game_mechanics::QGameMechanics;
 
 /// Transposition table type alias.
 pub type TranspositionTable = DashMap<u64, i8>;
 
-/// SQLite-backed policy database for storing and querying pre-computed minimax values.
+/// Number of rows per Parquet row group. Larger means fewer groups (less
+/// per-group overhead) but larger decode units. 1M is a good general default.
+const ROW_GROUP_SIZE: usize = 1_000_000;
+
+/// Per-batch chunk size when streaming rows into the writer. Each chunk
+/// becomes one Arrow `RecordBatch`; the writer buffers them up to a row
+/// group and then flushes.
+const WRITE_CHUNK_SIZE: usize = 65_536;
+
+/// Per-row-group statistics cached at open time, used to prune lookups.
+/// State values are stored in the Parquet file as `Int64` (the same 64
+/// bits as the underlying `u64`). All comparisons here are signed `i64`,
+/// matching the Parquet sort/statistics ordering. Callers convert to/from
+/// `u64` via `as` casts at the boundary.
+#[derive(Clone, Debug)]
+struct RowGroupStats {
+    idx: usize,
+    min: i64,
+    max: i64,
+    num_rows: u64,
+}
+
+/// Decoded contents of one row group, kept around when we want to reuse
+/// it across nearby lookups in the same call.
+struct DecodedRowGroup {
+    states: Vec<i64>,
+    values: Vec<i8>,
+}
+
+/// Parquet-backed policy database for storing and querying pre-computed
+/// minimax values. Single file per DB; sorted by `state` for efficient
+/// row-group pruning on point lookups.
 pub struct PolicyDb {
-    conn: Connection,
+    path: String,
+    metadata: ArrowReaderMetadata,
+    row_groups: Vec<RowGroupStats>,
+    /// `cum_rows[i]` = sum of `num_rows` over row groups `0..i`.
+    /// Length `row_groups.len() + 1`. `cum_rows.last()` = total rows.
+    cum_rows: Vec<u64>,
     mechanics: QGameMechanics,
+    board_size: usize,
+    max_walls: usize,
+    max_steps: usize,
+    num_states: usize,
+}
+
+fn schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("state", DataType::Int64, false),
+        Field::new("value", DataType::Int8, false),
+    ]))
+}
+
+fn parse_meta(kv: Option<&Vec<KeyValue>>, key: &str) -> Option<usize> {
+    kv?.iter()
+        .find(|e| e.key == key)
+        .and_then(|e| e.value.as_ref())
+        .and_then(|v| v.parse().ok())
 }
 
 impl PolicyDb {
     /// Open an existing policy database for reading.
-    ///
-    /// Reads metadata to initialize game mechanics for state interpretation.
     pub fn open(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let conn = Connection::open_with_flags(
-            Path::new(path),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        let file = File::open(Path::new(path))?;
+        let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
 
-        // Read metadata to create mechanics.
-        let mut stmt = conn.prepare("SELECT key, value FROM metadata")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-        })?;
-        let mut board_size = None;
-        let mut max_walls = None;
-        let mut max_steps = None;
-        for row in rows {
-            let (key, value) = row?;
-            match key.as_str() {
-                "board_size" => board_size = Some(value as usize),
-                "max_walls" => max_walls = Some(value as usize),
-                "max_steps" => max_steps = Some(value as usize),
-                _ => {}
-            }
+        let kv = metadata.metadata().file_metadata().key_value_metadata();
+        let board_size = parse_meta(kv, "board_size")
+            .ok_or("missing board_size in parquet metadata")?;
+        let max_walls = parse_meta(kv, "max_walls")
+            .ok_or("missing max_walls in parquet metadata")?;
+        let max_steps = parse_meta(kv, "max_steps")
+            .ok_or("missing max_steps in parquet metadata")?;
+        let num_states_meta = parse_meta(kv, "num_states");
+
+        let mechanics = QGameMechanics::new(board_size, max_walls, max_steps);
+
+        let pq_meta = metadata.metadata();
+        let num_row_groups = pq_meta.num_row_groups();
+        let mut row_groups = Vec::with_capacity(num_row_groups);
+        let mut cum_rows = Vec::with_capacity(num_row_groups + 1);
+        cum_rows.push(0u64);
+        let mut total = 0u64;
+        for i in 0..num_row_groups {
+            let rg = pq_meta.row_group(i);
+            let num_rows = rg.num_rows() as u64;
+            let stats = rg.column(0).statistics().ok_or_else(|| {
+                format!("row group {i} missing statistics on state column")
+            })?;
+            let (min, max) = match stats {
+                Statistics::Int64(s) => (
+                    *s.min_opt().ok_or("missing min stat on state")?,
+                    *s.max_opt().ok_or("missing max stat on state")?,
+                ),
+                _ => return Err(format!("unexpected stats variant for state column: {stats:?}").into()),
+            };
+            row_groups.push(RowGroupStats { idx: i, min, max, num_rows });
+            total += num_rows;
+            cum_rows.push(total);
         }
-        drop(stmt);
 
-        let mechanics = QGameMechanics::new(
-            board_size.ok_or("missing board_size in metadata")?,
-            max_walls.ok_or("missing max_walls in metadata")?,
-            max_steps.ok_or("missing max_steps in metadata")?,
-        );
+        // Prefer the cached count from metadata, fall back to summed row counts.
+        let num_states = num_states_meta.unwrap_or(total as usize);
 
-        Ok(Self { conn, mechanics })
+        Ok(Self {
+            path: path.to_string(),
+            metadata,
+            row_groups,
+            cum_rows,
+            mechanics,
+            board_size,
+            max_walls,
+            max_steps,
+            num_states,
+        })
     }
 
     /// Get a reference to the game mechanics.
@@ -63,11 +152,44 @@ impl PolicyDb {
         &self.mechanics
     }
 
+    /// Read metadata: `(board_size, max_walls, max_steps, num_states)`.
+    pub fn read_metadata(
+        &self,
+    ) -> Result<(usize, usize, usize, Option<usize>), Box<dyn std::error::Error>> {
+        Ok((self.board_size, self.max_walls, self.max_steps, Some(self.num_states)))
+    }
+
+    /// Count the total number of states.
+    pub fn count_states(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        Ok(self.num_states)
+    }
+
+    /// Decode a single row group into `(states, values)` columns.
+    /// Reopens the file so this is safe to call from a `&self` context
+    /// without interior mutability or sync.
+    fn decode_row_group(
+        &self,
+        rg_idx: usize,
+    ) -> Result<DecodedRowGroup, Box<dyn std::error::Error>> {
+        let file = File::open(&self.path)?;
+        let mut reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, self.metadata.clone())
+            .with_row_groups(vec![rg_idx])
+            .with_batch_size(self.row_groups[rg_idx].num_rows as usize)
+            .build()?;
+
+        let mut states = Vec::with_capacity(self.row_groups[rg_idx].num_rows as usize);
+        let mut values = Vec::with_capacity(self.row_groups[rg_idx].num_rows as usize);
+        while let Some(batch) = reader.next() {
+            let batch = batch?;
+            append_batch(&batch, &mut states, &mut values)?;
+        }
+        Ok(DecodedRowGroup { states, values })
+    }
+
     /// Look up values for all actions reachable from the given state.
     ///
     /// Returns `None` if there are no valid actions or no DB entries were found.
-    /// Otherwise returns `(actions, values)` where values are from the acting
-    /// player's perspective (positive = good for the acting player).
+    /// Values are returned from the acting player's perspective.
     pub fn lookup_action_values(
         &self,
         data: u64,
@@ -83,22 +205,16 @@ impl PolicyDb {
             .into_iter()
             .map(|(r, c)| (r as u8, c as u8, 2))
             .collect();
-        actions.extend(
-            walls
-                .into_iter()
-                .map(|(r, c, t)| (r as u8, c as u8, t as u8)),
-        );
+        actions.extend(walls.into_iter().map(|(r, c, t)| (r as u8, c as u8, t as u8)));
 
         if actions.is_empty() {
             return Ok(None);
         }
 
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT value FROM policy WHERE state = ?1")?;
-
-        let mut values = Vec::with_capacity(actions.len());
-        let mut any_found = false;
+        // Compute child states and classify each as terminal-or-DB-lookup.
+        // P0-perspective values: 1 = P0 wins, 0 = tie, -1 = P1 wins.
+        let mut child_states = Vec::with_capacity(actions.len());
+        let mut terminal_p0: Vec<Option<i32>> = Vec::with_capacity(actions.len());
 
         for &(row, col, action_type) in &actions {
             let mut child_data = data;
@@ -111,42 +227,51 @@ impl PolicyDb {
             mechanics.switch_player(&mut child_data);
 
             let child_cp = mechanics.repr().get_current_player(child_data);
-            let child_opponent = 1 - child_cp;
+            let child_opp = 1 - child_cp;
 
-            // P0-perspective value for this child state.
-            let value_p0: i32 = if mechanics.check_win(child_data, child_opponent) {
-                // child_opponent just won
-                any_found = true;
-                if child_opponent == 0 {
-                    1
-                } else {
-                    -1
-                }
+            let term = if mechanics.check_win(child_data, child_opp) {
+                Some(if child_opp == 0 { 1 } else { -1 })
             } else if mechanics.repr().get_completed_steps(child_data)
                 >= mechanics.repr().max_steps()
             {
-                any_found = true;
-                0
+                Some(0)
             } else {
-                let result: Result<i32, _> = stmt.query_row(
-                    rusqlite::params![child_data.to_le_bytes().as_ref()],
-                    |row| row.get(0),
-                );
-                match result {
-                    Ok(v) => {
-                        any_found = true;
-                        v
-                    }
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {
-                        panic!("No DB entry found for child state")
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+                None
             };
 
-            // Convert from P0 perspective to acting player's perspective.
-            let value = if cp == 0 { value_p0 } else { -value_p0 };
-            values.push(value);
+            child_states.push(child_data);
+            terminal_p0.push(term);
+        }
+
+        // Batch-look up all non-terminal children in one sorted sweep.
+        let need_lookup: Vec<u64> = child_states
+            .iter()
+            .zip(terminal_p0.iter())
+            .filter(|(_, t)| t.is_none())
+            .map(|(s, _)| *s)
+            .collect();
+
+        let lookup_pairs = self.lookup_values_by_state(&need_lookup)?;
+        let lookup_map: HashMap<u64, i32> = lookup_pairs.into_iter().collect();
+
+        let mut values = Vec::with_capacity(actions.len());
+        let mut any_found = false;
+        for (child, term) in child_states.iter().zip(terminal_p0.iter()) {
+            let value_p0: i32 = match term {
+                Some(v) => {
+                    any_found = true;
+                    *v
+                }
+                None => match lookup_map.get(child) {
+                    Some(v) => {
+                        any_found = true;
+                        *v
+                    }
+                    None => panic!("No DB entry found for child state"),
+                },
+            };
+            // Convert P0-perspective to acting-player perspective.
+            values.push(if cp == 0 { value_p0 } else { -value_p0 });
         }
 
         if !any_found {
@@ -156,100 +281,111 @@ impl PolicyDb {
         Ok(Some((actions, values)))
     }
 
-    /// Read metadata from the database.
+    /// Fetch states and values by 1-based rowid (matches old SQLite ROWID
+    /// semantics: row N is the Nth entry in sorted-state order).
     ///
-    /// Returns `(board_size, max_walls, max_steps, num_states)` where
-    /// `num_states` is `None` if not present in the metadata table.
-    pub fn read_metadata(&self) -> Result<(usize, usize, usize, Option<usize>), Box<dyn std::error::Error>> {
-        let mut stmt = self.conn.prepare("SELECT key, value FROM metadata")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-        })?;
-
-        let mut board_size = None;
-        let mut max_walls = None;
-        let mut max_steps = None;
-        let mut num_states = None;
-
-        for row in rows {
-            let (key, value) = row?;
-            match key.as_str() {
-                "board_size" => board_size = Some(value as usize),
-                "max_walls" => max_walls = Some(value as usize),
-                "max_steps" => max_steps = Some(value as usize),
-                "num_states" => num_states = Some(value as usize),
-                _ => {}
-            }
-        }
-
-        Ok((
-            board_size.ok_or("missing board_size in metadata")?,
-            max_walls.ok_or("missing max_walls in metadata")?,
-            max_steps.ok_or("missing max_steps in metadata")?,
-            num_states,
-        ))
-    }
-
-    /// Count the total number of states in the policy table.
-    pub fn count_states(&self) -> Result<usize, Box<dyn std::error::Error>> {
-        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM policy", [], |row| row.get(0))?;
-        Ok(count as usize)
-    }
-
-    /// Fetch states and values by rowid.
-    ///
-    /// Returns a list of `(state, value)` tuples for each found rowid, where
-    /// `state` is the u64 packed state.
-    pub fn fetch_states_by_rowid(&self, rowids: &[i64]) -> Result<Vec<(u64, i32)>, Box<dyn std::error::Error>> {
+    /// Returns one `(state, value)` per requested rowid, in ascending rowid
+    /// order. Rowids out of range are silently dropped.
+    pub fn fetch_states_by_rowid(
+        &self,
+        rowids: &[i64],
+    ) -> Result<Vec<(u64, i32)>, Box<dyn std::error::Error>> {
         if rowids.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders: String = std::iter::repeat("?").take(rowids.len()).collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT state, value FROM policy WHERE rowid IN ({})", placeholders);
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(rowids.iter()), |row| {
-            let bytes: Vec<u8> = row.get(0)?;
-            let mut arr = [0u8; 8];
-            arr[..bytes.len()].copy_from_slice(&bytes);
-            Ok((u64::from_le_bytes(arr), row.get::<_, i32>(1)?))
-        })?;
-        let mut results = Vec::with_capacity(rowids.len());
-        for row in rows {
-            results.push(row?);
+        let total_rows = *self.cum_rows.last().unwrap_or(&0);
+
+        let mut sorted: Vec<u64> = rowids
+            .iter()
+            .filter_map(|&r| {
+                if r >= 1 && (r as u64) <= total_rows {
+                    Some((r - 1) as u64)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        sorted.sort_unstable();
+
+        let mut results = Vec::with_capacity(sorted.len());
+        let mut current_rg: Option<usize> = None;
+        let mut decoded: Option<DecodedRowGroup> = None;
+
+        for r0 in sorted {
+            // cum_rows is sorted ascending; find the row group whose range
+            // [cum_rows[i], cum_rows[i+1]) contains r0.
+            let rg_idx = match self.cum_rows.binary_search(&r0) {
+                Ok(i) => i,        // r0 is the first row of group i
+                Err(i) => i - 1,   // r0 falls in group i-1
+            };
+            let row_in_group = (r0 - self.cum_rows[rg_idx]) as usize;
+
+            if current_rg != Some(rg_idx) {
+                decoded = Some(self.decode_row_group(rg_idx)?);
+                current_rg = Some(rg_idx);
+            }
+            let dec = decoded.as_ref().unwrap();
+            let s = dec.states[row_in_group] as u64;
+            let v = dec.values[row_in_group] as i32;
+            results.push((s, v));
         }
+
         Ok(results)
     }
 
     /// Look up values for the given states.
     ///
-    /// Returns a list of `(state, value)` for each state found in the DB.
-    /// States not present in the DB are omitted from the result.
-    pub fn lookup_values_by_state(&self, states: &[u64]) -> Result<Vec<(u64, i32)>, Box<dyn std::error::Error>> {
+    /// Returns `(state, value)` for each state found in the DB. States
+    /// not present are omitted. Internally walks row groups in sorted
+    /// order, decoding each at most once.
+    pub fn lookup_values_by_state(
+        &self,
+        states: &[u64],
+    ) -> Result<Vec<(u64, i32)>, Box<dyn std::error::Error>> {
         if states.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders: String = std::iter::repeat("?").take(states.len()).collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT state, value FROM policy WHERE state IN ({})", placeholders);
-        let mut stmt = self.conn.prepare(&sql)?;
-        let blobs: Vec<Vec<u8>> = states.iter().map(|s| s.to_le_bytes().to_vec()).collect();
-        let params: Vec<&dyn rusqlite::ToSql> = blobs.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
-        let rows = stmt.query_map(params.as_slice(), |row| {
-            let bytes: Vec<u8> = row.get(0)?;
-            let mut arr = [0u8; 8];
-            arr[..bytes.len()].copy_from_slice(&bytes);
-            Ok((u64::from_le_bytes(arr), row.get::<_, i32>(1)?))
-        })?;
-        let mut results = Vec::with_capacity(states.len());
-        for row in rows {
-            results.push(row?);
+        let mut sorted: Vec<i64> = states.iter().map(|&s| s as i64).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+
+        let mut results = Vec::new();
+        let mut q_idx = 0usize;
+        let mut rg_idx = 0usize;
+
+        while q_idx < sorted.len() && rg_idx < self.row_groups.len() {
+            let q = sorted[q_idx];
+            let rg = &self.row_groups[rg_idx];
+
+            if q < rg.min {
+                // Sorted file: q can't appear in any later row group either.
+                q_idx += 1;
+            } else if q > rg.max {
+                rg_idx += 1;
+            } else {
+                // q is in [min, max]; decode this row group once and
+                // resolve every query whose value falls in the same range.
+                let decoded = self.decode_row_group(rg.idx)?;
+                while q_idx < sorted.len() && sorted[q_idx] <= rg.max {
+                    let q2 = sorted[q_idx];
+                    if q2 >= rg.min {
+                        if let Ok(pos) = decoded.states.binary_search(&q2) {
+                            results.push((q2 as u64, decoded.values[pos] as i32));
+                        }
+                    }
+                    q_idx += 1;
+                }
+                rg_idx += 1;
+            }
         }
+
         Ok(results)
     }
 
     /// Create a new policy database from a transposition table.
     ///
     /// Only states where `completed_steps % step_interval == 0` are saved.
-    /// Returns the number of entries written.
+    /// Returns the number of entries written (after filtering).
     pub fn write(
         mechanics: &QGameMechanics,
         entries: TranspositionTable,
@@ -259,82 +395,87 @@ impl PolicyDb {
         max_walls: usize,
         step_interval: usize,
     ) -> Result<usize, Box<dyn std::error::Error>> {
-        let mut conn = Connection::open(Path::new(path))?;
-
-        // Performance pragmas: disable journaling and syncs during bulk insert.
-        conn.execute_batch(
-            "PRAGMA journal_mode = OFF;
-             PRAGMA synchronous = OFF;
-             PRAGMA locking_mode = EXCLUSIVE;
-             PRAGMA temp_store = MEMORY;
-             PRAGMA cache_size = -64000;",
-        )?;
-
-        conn.execute("DROP TABLE IF EXISTS policy", [])?;
-        conn.execute("DROP TABLE IF EXISTS metadata", [])?;
-
-        conn.execute(
-            "CREATE TABLE metadata (
-                key TEXT PRIMARY KEY,
-                value FLOAT NOT NULL
-            )",
-            [],
-        )?;
-
-        conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('board_size', ?1)",
-            params![board_size as f32],
-        )?;
-        conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('max_steps', ?1)",
-            params![max_steps as f32],
-        )?;
-        conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('max_walls', ?1)",
-            params![max_walls as f32],
-        )?;
-
-        // Create table with autoincrementing ID for efficient random sampling.
-        conn.execute(
-            "CREATE TABLE policy (
-                state BLOB,
-                value INTEGER NOT NULL
-            )",
-            [],
-        )?;
-
-        let num_entries = entries.len();
-
-        let tx = conn.transaction()?;
-        {
-            let mut stmt = tx.prepare("INSERT INTO policy (state, value) VALUES (?1, ?2)")?;
-
-            for (key, value) in entries.into_iter() {
-                let steps = mechanics.repr().get_completed_steps(key);
-                if steps % step_interval != 0 {
-                    continue;
+        // Drain DashMap, apply step_interval filter, sort by state.
+        // Sort uses i64 so the on-disk order matches the read-time
+        // statistics ordering (Parquet Int64 stats are signed).
+        let mut rows: Vec<(i64, i8)> = entries
+            .into_iter()
+            .filter_map(|(s, v)| {
+                let steps = mechanics.repr().get_completed_steps(s);
+                if steps % step_interval == 0 {
+                    Some((s as i64, v))
+                } else {
+                    None
                 }
+            })
+            .collect();
+        rows.sort_unstable_by_key(|(s, _)| *s);
 
-                // Store P0-absolute values (1=P0 wins, -1=P0 loses).
-                stmt.execute(params![key.to_le_bytes().as_ref(), value as i32])?;
-            }
-            drop(stmt);
+        let num_rows = rows.len();
+        let kv_metadata = vec![
+            KeyValue {
+                key: "board_size".to_string(),
+                value: Some(board_size.to_string()),
+            },
+            KeyValue {
+                key: "max_walls".to_string(),
+                value: Some(max_walls.to_string()),
+            },
+            KeyValue {
+                key: "max_steps".to_string(),
+                value: Some(max_steps.to_string()),
+            },
+            KeyValue {
+                key: "num_states".to_string(),
+                value: Some(num_rows.to_string()),
+            },
+        ];
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+            .set_max_row_group_size(ROW_GROUP_SIZE)
+            .set_key_value_metadata(Some(kv_metadata))
+            .build();
+
+        let schema = schema();
+        let file = File::create(Path::new(path))?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+
+        // Stream rows in moderate chunks so we don't allocate one giant batch.
+        for chunk in rows.chunks(WRITE_CHUNK_SIZE) {
+            let states: Vec<i64> = chunk.iter().map(|(s, _)| *s).collect();
+            let values: Vec<i8> = chunk.iter().map(|(_, v)| *v).collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(states)), Arc::new(Int8Array::from(values))],
+            )?;
+            writer.write(&batch)?;
         }
-        tx.commit()?;
+        writer.close()?;
 
-        // Create index after all inserts (much faster than maintaining during insert).
-        conn.execute("CREATE UNIQUE INDEX idx_policy_state ON policy(state)", [])?;
-
-        // Store the number of policy states in metadata for efficient random sampling.
-        let num_policy_rows: i64 =
-            conn.query_row("SELECT COUNT(*) FROM policy", [], |row| row.get(0))?;
-        conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('num_states', ?1)",
-            params![num_policy_rows as f64],
-        )?;
-
-        Ok(num_entries)
+        Ok(num_rows)
     }
+}
+
+/// Append a record batch's two columns to the running state/value vectors.
+fn append_batch(
+    batch: &RecordBatch,
+    states: &mut Vec<i64>,
+    values: &mut Vec<i8>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let s_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or("state column is not Int64")?;
+    let v_col = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int8Array>()
+        .ok_or("value column is not Int8")?;
+    states.extend_from_slice(s_col.values());
+    values.extend_from_slice(v_col.values());
+    Ok(())
 }
 
 /// Get all valid actions (moves + wall placements) for the current player.
@@ -483,6 +624,7 @@ pub fn minimax_lazy_smp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_minimax_initial_state_3x3() {
@@ -532,5 +674,96 @@ mod tests {
         minimax(&mechanics, &mut data, &table);
 
         assert!(!table.is_empty(), "Transposition table should have entries");
+    }
+
+    /// End-to-end: write a small DB, reopen it, verify metadata, count, and
+    /// every state we wrote can be looked up by both rowid and state value.
+    #[test]
+    fn test_write_then_read_roundtrip() {
+        let mechanics = QGameMechanics::new(3, 0, 8);
+        let mut root = mechanics.create_initial_state();
+        let table = TranspositionTable::new();
+        minimax(&mechanics, &mut root, &table);
+        assert!(!table.is_empty());
+
+        // Snapshot expected entries before write() drains the DashMap.
+        let expected: Vec<(u64, i8)> =
+            table.iter().map(|kv| (*kv.key(), *kv.value())).collect();
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.parquet");
+        let path_str = path.to_str().unwrap();
+        let written = PolicyDb::write(
+            &mechanics,
+            table,
+            path_str,
+            3,    // board_size
+            8,    // max_steps
+            0,    // max_walls
+            1,    // step_interval (keep all)
+        )
+        .unwrap();
+        assert_eq!(written, expected.len());
+
+        let db = PolicyDb::open(path_str).unwrap();
+        assert_eq!(
+            db.read_metadata().unwrap(),
+            (3, 0, 8, Some(expected.len()))
+        );
+        assert_eq!(db.count_states().unwrap(), expected.len());
+
+        // Round-trip every entry by state lookup.
+        let states: Vec<u64> = expected.iter().map(|(s, _)| *s).collect();
+        let pairs = db.lookup_values_by_state(&states).unwrap();
+        assert_eq!(pairs.len(), expected.len());
+        let got_map: HashMap<u64, i32> = pairs.into_iter().collect();
+        for (s, v) in &expected {
+            assert_eq!(got_map.get(s), Some(&(*v as i32)));
+        }
+
+        // Round-trip every entry by sequential rowid scan.
+        let all_ids: Vec<i64> = (1..=expected.len() as i64).collect();
+        let by_id = db.fetch_states_by_rowid(&all_ids).unwrap();
+        assert_eq!(by_id.len(), expected.len());
+        let by_id_map: HashMap<u64, i32> = by_id.into_iter().collect();
+        for (s, v) in &expected {
+            assert_eq!(by_id_map.get(s), Some(&(*v as i32)));
+        }
+    }
+
+    /// `lookup_action_values` should resolve terminal child states inline
+    /// (without DB lookup) and DB-resident children via the Parquet sweep.
+    #[test]
+    fn test_lookup_action_values_terminal() {
+        let mechanics = QGameMechanics::new(3, 0, 8);
+        let mut root = mechanics.create_initial_state();
+        let table = TranspositionTable::new();
+        minimax(&mechanics, &mut root, &table);
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.parquet");
+        let path_str = path.to_str().unwrap();
+        PolicyDb::write(&mechanics, table, path_str, 3, 8, 0, 1).unwrap();
+
+        let db = PolicyDb::open(path_str).unwrap();
+
+        // Construct a state where P0 is one row from goal — at least one
+        // child action wins immediately (terminal child, no DB lookup).
+        let mut state = mechanics.create_initial_state();
+        mechanics.repr().set_player_position(&mut state, 0, 1, 1);
+        mechanics.repr().set_player_position(&mut state, 1, 2, 0);
+        mechanics.repr().set_current_player(&mut state, 0);
+        mechanics.repr().set_completed_steps(&mut state, 2);
+
+        let result = db.lookup_action_values(state).unwrap();
+        let (actions, values) = result.expect("should have valid actions");
+        assert_eq!(actions.len(), values.len());
+        assert!(!actions.is_empty());
+        // At least one action should yield a winning value (1) from the
+        // acting player's perspective.
+        assert!(
+            values.iter().any(|&v| v == 1),
+            "expected at least one winning action value, got {values:?}"
+        );
     }
 }
