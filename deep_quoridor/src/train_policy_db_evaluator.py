@@ -26,6 +26,7 @@ from agents.alphazero.alphazero import AlphaZeroParams
 from agents.alphazero.nn_evaluator import NNConfig, NNEvaluator
 from quoridor import ActionEncoder, Board, Player, Quoridor
 from utils.subargs import parse_subargs
+from utils.timer import Timer, timer
 
 DEBUG = False
 
@@ -49,10 +50,11 @@ def policy_to_str(policy, action_encoder):
 # ---------------------------------------------------------------------------
 
 
-def compact_state_to_game(state_bytes, board_size, max_walls, max_steps):
-    """Convert compact state bytes to a Quoridor game object."""
+@timer("compact_state_to_game")
+def compact_state_to_game(state, board_size, max_walls, max_steps):
+    """Convert a compact state (Python int) to a Quoridor game object."""
     grid, player_positions, walls_remaining, old_style_walls, current_player, completed_steps = (
-        quoridor_rs.compact_state_to_game_state(state_bytes, board_size, max_walls, max_steps)
+        quoridor_rs.compact_state_to_game_state(state, board_size, max_walls, max_steps)
     )
     board = Board.from_arrays(
         board_size,
@@ -77,7 +79,8 @@ def child_action_index(row, col, action_type, board_size):
     raise ValueError(f"Unknown action_type {action_type}")
 
 
-def build_policy_from_action_values(db, state_bytes, board_size, num_actions):
+@timer("build_policy_from_action_values")
+def build_policy_from_action_values(db, state, board_size, num_actions):
     """Build a policy vector from DB action values.
 
     Uses lookup_action_values which correctly handles terminal child states.
@@ -86,7 +89,7 @@ def build_policy_from_action_values(db, state_bytes, board_size, num_actions):
 
     Returns the policy array, or None if no valid actions.
     """
-    result = db.lookup_action_values(state_bytes)
+    result = db.lookup_action_values(state)
     assert result is not None
 
     actions, values = result
@@ -101,6 +104,7 @@ def build_policy_from_action_values(db, state_bytes, board_size, num_actions):
     return policy
 
 
+@timer("fetch_batch")
 def fetch_batch(db, ids, evaluator: NNEvaluator, board_size, max_walls, max_steps):
     """Fetch rows by rowid from the policy table and compute features on the fly.
 
@@ -114,8 +118,7 @@ def fetch_batch(db, ids, evaluator: NNEvaluator, board_size, max_walls, max_step
     num_actions = evaluator.action_encoder.num_actions
     samples = []
     for state, value in rows:
-        state_bytes = bytes(state)
-        game = compact_state_to_game(state_bytes, board_size, max_walls, max_steps)
+        game = compact_state_to_game(state, board_size, max_walls, max_steps)
         current_player = int(game.current_player)
         if current_player == 1:
             # DB Values are always from P1 perspective
@@ -123,10 +126,11 @@ def fetch_batch(db, ids, evaluator: NNEvaluator, board_size, max_walls, max_step
 
         mcts_policy = build_policy_from_action_values(
             db,
-            state_bytes,
+            state,
             board_size,
             num_actions,
         )
+        db_policy_original = mcts_policy.copy()
 
         # Do the rotation, in the same way AlphaZeroAgent.store_training_data() does
         game, is_rotated = evaluator.rotate_if_needed_to_point_downwards(game)
@@ -149,6 +153,8 @@ def fetch_batch(db, ids, evaluator: NNEvaluator, board_size, max_walls, max_step
                 "action_mask": action_mask,
                 "mcts_policy": mcts_policy,
                 "current_player": current_player,
+                "state": state,
+                "db_policy_original": db_policy_original,
             }
         )
     return samples
@@ -159,6 +165,7 @@ def fetch_batch(db, ids, evaluator: NNEvaluator, board_size, max_walls, max_step
 # ---------------------------------------------------------------------------
 
 
+@timer("compute_accuracy")
 def compute_accuracy(
     test_ids, db, evaluator: NNEvaluator, board_size, max_walls, max_steps, num_samples, test_player=None
 ):
@@ -176,17 +183,15 @@ def compute_accuracy(
     correct = 0
     total = 0
     inaccurate_printed = 0
-    for state_blob, _value in rows:
-        state_bytes = bytes(state_blob)
-
-        game = compact_state_to_game(state_bytes, board_size, max_walls, max_steps)
+    for state, _value in rows:
+        game = compact_state_to_game(state, board_size, max_walls, max_steps)
         current_player = int(game.current_player)
         if test_player is not None and current_player != test_player:
             continue
 
         db_policy = build_policy_from_action_values(
             db,
-            state_bytes,
+            state,
             board_size,
             evaluator.action_encoder.num_actions,
         )
@@ -205,9 +210,53 @@ def compute_accuracy(
                 print(game)
                 print(f"DB optimal actions: {policy_to_str(db_policy, evaluator.action_encoder)}")
                 print(f"Model optimal actions: {policy_to_str(model_policy, evaluator.action_encoder)}")
+
+        Timer.log_totals()
         total += 1
 
     return correct / total
+
+
+@timer("compute_test_metrics_batched")
+def compute_test_metrics_batched(
+    num_states, db, evaluator: NNEvaluator, board_size, max_walls, max_steps, batch_size, test_player=None
+):
+    """Compute test loss and accuracy over all states by iterating in batches.
+
+    Returns (policy_loss, value_loss, total_loss, accuracy) as floats.
+    """
+    total_pol = total_val = total_tot = 0.0
+    correct = total = 0
+
+    evaluator.network.eval()
+    with torch.no_grad():
+        for start in range(1, num_states + 1, batch_size):
+            batch_ids = list(range(start, min(start + batch_size, num_states + 1)))
+            samples = fetch_batch(db, batch_ids, evaluator, board_size, max_walls, max_steps)
+            if test_player is not None:
+                samples = [s for s in samples if s["current_player"] == test_player]
+            assert samples is not None, "fetch_batch should never return None"
+
+            n = len(samples)
+            pol, val, tot = evaluator.compute_losses(samples)
+            total_pol += pol.item() * n
+            total_val += val.item() * n
+            total_tot += tot.item() * n
+
+            for s in samples:
+                original_game = compact_state_to_game(s["state"], board_size, max_walls, max_steps)
+                _, model_policy = evaluator.evaluate(original_game)
+                db_policy = s["db_policy_original"]
+                best_db_prob = max(db_policy)
+                model_pick = int(np.argmax(model_policy))
+                if db_policy[model_pick] == best_db_prob:
+                    correct += 1
+                total += 1
+
+    evaluator.network.train()
+
+    assert total > 0, "No test samples found (check test_player filter?)"
+    return total_pol / total, total_val / total, total_tot / total, correct / total
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +277,12 @@ def parse_args():
         help="AlphaZero params in subargs form (e.g. nn_type=mlp,learning_rate=0.001)",
     )
     p.add_argument("--test-fraction", type=float, default=0.1)
+    p.add_argument(
+        "--test-batch-size",
+        type=int,
+        default=None,
+        help="If set, test on all states using sequential batches of this size (ignores --test-fraction and --exclude-test-set)",
+    )
     p.add_argument("--num-steps", type=int, default=10000)
     p.add_argument("--log-interval", type=int, default=200)
     p.add_argument("--accuracy-states", type=int, default=200)
@@ -286,18 +341,20 @@ def main():
     use_wandb = args.wandb is not None
     if use_wandb:
         wandb_project = args.wandb if args.wandb else "policydb_evaluator"
-        wandb.init(
+        wandb_run = wandb.init(
             project=wandb_project,
             config={
                 "db_path": os.path.basename(args.db_path),
                 "num_steps": args.num_steps,
                 "test_fraction": args.test_fraction,
+                "test_batch_size": args.test_batch_size,
                 "test_player": args.test_player,
                 "exclude_test_set": args.exclude_test_set,
                 "output": args.output,
                 **asdict(az_params),
             },
         )
+        Timer.set_wandb_run(wandb_run)
         wandb.define_metric("step", hidden=True)
         wandb.define_metric("train/*", step_metric="step")
         wandb.define_metric("test/*", step_metric="step")
@@ -324,10 +381,14 @@ def main():
     # ------------------------------------------------------------------
     # Train/test split by ID (IDs are 1-based, contiguous)
     # ------------------------------------------------------------------
-    test_size = min(max(1, int(num_states * args.test_fraction)), MAX_TEST_SIZE)
-    test_id_set = set(random.sample(range(1, num_states + 1), test_size))
-    test_ids = sorted(test_id_set)
-    print(f"Train size: ~{num_states - test_size}, test size: {len(test_ids)}")
+    if args.test_batch_size is not None:
+        test_id_set = None
+        print(f"Full-DB test mode: {num_states} states, test batch size {args.test_batch_size}")
+    else:
+        test_size = min(max(1, int(num_states * args.test_fraction)), MAX_TEST_SIZE)
+        test_id_set = set(random.sample(range(1, num_states + 1), test_size))
+        test_ids = sorted(test_id_set)
+        print(f"Train size: ~{num_states - test_size}, test size: {len(test_ids)}")
 
     # ------------------------------------------------------------------
     # Create NNEvaluator and set up optimizer
@@ -339,15 +400,17 @@ def main():
     # ------------------------------------------------------------------
     # Pre-compute test samples (test set is small / capped)
     # ------------------------------------------------------------------
-    print("Computing test features...")
-    test_samples = fetch_batch(db, test_ids, evaluator, board_size, max_walls, max_steps)
-
-    # Filter test set by player if requested.
-    if test_player is not None:
-        test_samples = [s for s in test_samples if s["current_player"] == test_player]
-        print(f"Filtered test set to {len(test_samples)} states for player {args.test_player}")
-
-    feature_dim = test_samples[0]["input_array"].shape[0]
+    if args.test_batch_size is None:
+        print("Computing test features...")
+        test_samples = fetch_batch(db, test_ids, evaluator, board_size, max_walls, max_steps)
+        if test_player is not None:
+            test_samples = [s for s in test_samples if s["current_player"] == test_player]
+            print(f"Filtered test set to {len(test_samples)} states for player {args.test_player}")
+        feature_dim = test_samples[0]["input_array"].shape[0]
+    else:
+        test_samples = None
+        probe = fetch_batch(db, [1], evaluator, board_size, max_walls, max_steps)
+        feature_dim = probe[0]["input_array"].shape[0]
     print(f"Feature dim: {feature_dim}")
 
     if use_wandb:
@@ -357,8 +420,8 @@ def main():
                 "max_walls": max_walls,
                 "max_steps": max_steps,
                 "num_states": num_states,
-                "train_size": num_states - test_size,
-                "test_size": len(test_samples),
+                "train_size": num_states if args.test_batch_size is not None else num_states - test_size,
+                "test_size": num_states if args.test_batch_size is not None else len(test_samples),
                 "feature_dim": feature_dim,
             }
         )
@@ -379,6 +442,7 @@ def main():
         )
 
     for step in range(1, args.num_steps + 1):
+        print(f"Step {step}/{args.num_steps}")
         if step % 100000 == 0:
             learning_rate = learning_rate / 2.0
             print(f"Lowering learning rate to {learning_rate}")
@@ -395,7 +459,7 @@ def main():
         # build_policy_from_children (missing children in DB).
         oversample = 4 if test_player is None else 8
         batch_ids = random.sample(range(1, num_states + 1), min(batch_size * oversample, num_states))
-        if args.exclude_test_set:
+        if args.exclude_test_set and test_id_set is not None:
             batch_ids = [i for i in batch_ids if i not in test_id_set]
         batch_samples = fetch_batch(db, batch_ids, evaluator, board_size, max_walls, max_steps)
         if test_player is not None:
@@ -414,24 +478,38 @@ def main():
             )
 
         if step % args.log_interval == 0 or step == 1:
-            evaluator.network.eval()
-            with torch.no_grad():
-                test_policy_loss, test_value_loss, test_total_loss = evaluator.compute_losses(test_samples)
-                test_policy_loss = test_policy_loss.item()
-                test_value_loss = test_value_loss.item()
-                test_total_loss = test_total_loss.item()
-            evaluator.network.train()
+            if args.test_batch_size is not None:
+                test_policy_loss, test_value_loss, test_total_loss, acc = compute_test_metrics_batched(
+                    num_states,
+                    db,
+                    evaluator,
+                    board_size,
+                    max_walls,
+                    max_steps,
+                    args.test_batch_size,
+                    test_player=test_player,
+                )
+            else:
+                evaluator.network.eval()
+                with torch.no_grad():
+                    test_policy_loss, test_value_loss, test_total_loss = evaluator.compute_losses(test_samples)
+                    test_policy_loss = test_policy_loss.item()
+                    test_value_loss = test_value_loss.item()
+                    test_total_loss = test_total_loss.item()
+                evaluator.network.train()
 
-            acc = compute_accuracy(
-                test_ids,
-                db,
-                evaluator,
-                board_size,
-                max_walls,
-                max_steps,
-                args.accuracy_states,
-                test_player=test_player,
-            )
+                Timer.log_totals()
+
+                acc = compute_accuracy(
+                    test_ids,
+                    db,
+                    evaluator,
+                    board_size,
+                    max_walls,
+                    max_steps,
+                    args.accuracy_states,
+                    test_player=test_player,
+                )
 
             print(
                 f"step {step:6d} | "

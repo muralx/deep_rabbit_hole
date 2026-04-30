@@ -370,7 +370,7 @@ fn q_evaluate_actions<'py>(
     // Evaluate actions using QBitRepr minimax
     let (actions, values, _logs) = compact::q_minimax::evaluate_actions(
         &mechanics,
-        &data,
+        data,
         max_search_depth,
         branching_factor,
         discount_factor,
@@ -430,7 +430,7 @@ fn policy_db_lookup<'py>(
     );
 
     match db
-        .lookup_action_values(&data)
+        .lookup_action_values(data)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("DB query error: {e}")))?
     {
         None => Ok(None),
@@ -459,7 +459,7 @@ fn policy_db_lookup<'py>(
 #[pyfunction]
 fn compact_state_to_game_state<'py>(
     py: Python<'py>,
-    state: &[u8],
+    state: u64,
     board_size: usize,
     max_walls: usize,
     max_steps: usize,
@@ -513,23 +513,23 @@ fn compact_state_to_game_state<'py>(
 #[cfg(feature = "python")]
 #[pyfunction]
 fn get_compact_child_states(
-    state: &[u8],
+    state: u64,
     board_size: usize,
     max_walls: usize,
     max_steps: usize,
-) -> Vec<(usize, usize, usize, Vec<u8>)> {
+) -> Vec<(usize, usize, usize, u64)> {
     use compact::q_game_mechanics::QGameMechanics;
 
     let mechanics = QGameMechanics::new(board_size, max_walls, max_steps);
     let current_player = mechanics.repr().get_current_player(state);
-    let mut data = state.to_vec();
+    let mut data = state;
 
     let mut children = Vec::new();
 
     // Pawn moves (action_type = 2)
-    let moves = mechanics.get_valid_moves(&data);
+    let moves = mechanics.get_valid_moves(data);
     for (row, col) in moves {
-        let mut child = data.clone();
+        let mut child = data;
         mechanics.execute_move(&mut child, current_player, row, col);
         mechanics.switch_player(&mut child);
         children.push((row, col, 2usize, child));
@@ -538,7 +538,7 @@ fn get_compact_child_states(
     // Wall placements (action_type = 0 or 1)
     let wall_placements = mechanics.get_valid_wall_placements(&mut data);
     for (row, col, orientation) in wall_placements {
-        let mut child = data.clone();
+        let mut child = data;
         mechanics.execute_wall_placement(&mut child, current_player, row, col, orientation);
         mechanics.switch_player(&mut child);
         children.push((row, col, orientation, child));
@@ -576,16 +576,15 @@ impl PyPolicyDb {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
     }
 
-    /// Fetch (state_bytes, value) tuples by rowid.
-    fn fetch_states_by_rowid(&self, rowids: Vec<i64>) -> PyResult<Vec<(Vec<u8>, i32)>> {
+    /// Fetch (state, value) tuples by rowid. State is a u64 packed integer.
+    fn fetch_states_by_rowid(&self, rowids: Vec<i64>) -> PyResult<Vec<(u64, i32)>> {
         self.db.fetch_states_by_rowid(&rowids)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
     }
 
-    /// Look up (state_bytes, value) for the given state blobs.
-    fn lookup_values_by_state(&self, states: Vec<Vec<u8>>) -> PyResult<Vec<(Vec<u8>, i32)>> {
-        let refs: Vec<&[u8]> = states.iter().map(|s| s.as_slice()).collect();
-        self.db.lookup_values_by_state(&refs)
+    /// Look up (state, value) for the given states.
+    fn lookup_values_by_state(&self, states: Vec<u64>) -> PyResult<Vec<(u64, i32)>> {
+        self.db.lookup_values_by_state(&states)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
     }
 
@@ -594,8 +593,8 @@ impl PyPolicyDb {
     /// Returns None if no valid actions, otherwise returns
     /// (actions, values) where actions is a list of (row, col, action_type)
     /// and values are from the acting player's perspective.
-    fn lookup_action_values(&self, state: Vec<u8>) -> PyResult<Option<(Vec<(u8, u8, u8)>, Vec<i32>)>> {
-        self.db.lookup_action_values(&state)
+    fn lookup_action_values(&self, state: u64) -> PyResult<Option<(Vec<(u8, u8, u8)>, Vec<i32>)>> {
+        self.db.lookup_action_values(state)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
     }
 }
@@ -604,7 +603,7 @@ impl PyPolicyDb {
 #[cfg(feature = "python")]
 #[pyfunction]
 fn compact_state_display(
-    state: &[u8],
+    state: u64,
     board_size: usize,
     max_walls: usize,
     max_steps: usize,

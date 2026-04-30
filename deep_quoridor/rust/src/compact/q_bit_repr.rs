@@ -1,8 +1,9 @@
 /// Compact bit-packed representation accessor for game states.
 ///
 /// This struct doesn't store the game state data itself - it only stores the
-/// parameters and computed offsets needed to interpret byte arrays as packed game states.
-/// The data is passed to each method, allowing flexible storage (stack or heap).
+/// parameters and computed offsets needed to interpret a u64 as a packed game state.
+/// The data is passed to each method by value (read) or mutable reference (write).
+/// Boards requiring more than 64 bits are not supported.
 
 // Wall orientations
 pub const WALL_VERTICAL: usize = 0;
@@ -33,7 +34,6 @@ pub struct QBitRepr {
     walls_remaining_bits: usize,
     completed_steps_bits: usize,
     total_bits: usize,
-    total_bytes: usize,
 
     // Bit offsets for each field
     walls_offset: usize,
@@ -63,7 +63,10 @@ impl QBitRepr {
         let completed_steps_offset = current_player_offset + 1;
 
         let total_bits = completed_steps_offset + completed_steps_bits;
-        let total_bytes = (total_bits + 7) / 8;
+        assert!(
+            total_bits <= 64,
+            "QBitRepr: state requires {total_bits} bits, which exceeds u64 capacity"
+        );
 
         Self {
             board_size,
@@ -75,19 +78,12 @@ impl QBitRepr {
             walls_remaining_bits,
             completed_steps_bits,
             total_bits,
-            total_bytes,
             walls_offset,
             player_pos_offsets,
             walls_remaining_offsets,
             current_player_offset,
             completed_steps_offset,
         }
-    }
-
-    /// Get the size of the packed representation in bytes
-    #[allow(dead_code)]
-    pub fn size_bytes(&self) -> usize {
-        self.total_bytes
     }
 
     #[allow(dead_code)]
@@ -106,55 +102,44 @@ impl QBitRepr {
         self.num_player_positions
     }
 
-    /// Create a new byte array for storing a packed state
-    pub fn create_data(&self) -> Vec<u8> {
-        vec![0u8; self.total_bytes]
+    /// Create a zero-initialized packed state value.
+    pub fn create_data(&self) -> u64 {
+        0u64
     }
 
     /// Get a bit at the specified position in the data
     #[inline]
-    fn get_bit(&self, data: &[u8], bit_index: usize) -> bool {
-        debug_assert!(data.len() >= self.total_bytes);
-        let byte_index = bit_index / 8;
-        let bit_offset = bit_index % 8;
-        (data[byte_index] >> bit_offset) & 1 == 1
+    fn get_bit(&self, data: u64, bit_index: usize) -> bool {
+        debug_assert!(bit_index < self.total_bits);
+        (data >> bit_index) & 1 == 1
     }
 
     /// Set a bit at the specified position in the data
     #[inline]
-    fn set_bit(&self, data: &mut [u8], bit_index: usize, value: bool) {
-        debug_assert!(data.len() >= self.total_bytes);
-        let byte_index = bit_index / 8;
-        let bit_offset = bit_index % 8;
+    fn set_bit(&self, data: &mut u64, bit_index: usize, value: bool) {
+        debug_assert!(bit_index < self.total_bits);
         if value {
-            data[byte_index] |= 1 << bit_offset;
+            *data |= 1u64 << bit_index;
         } else {
-            data[byte_index] &= !(1 << bit_offset);
+            *data &= !(1u64 << bit_index);
         }
     }
 
     /// Get an integer value starting at bit_offset with num_bits bits
     #[inline]
-    fn get_bits(&self, data: &[u8], bit_offset: usize, num_bits: usize) -> usize {
-        let mut value = 0usize;
-        for i in 0..num_bits {
-            if self.get_bit(data, bit_offset + i) {
-                value |= 1 << i;
-            }
-        }
-        value
+    fn get_bits(&self, data: u64, bit_offset: usize, num_bits: usize) -> usize {
+        ((data >> bit_offset) & ((1u64 << num_bits) - 1)) as usize
     }
 
     /// Set an integer value starting at bit_offset with num_bits bits
     #[inline]
-    fn set_bits(&self, data: &mut [u8], bit_offset: usize, num_bits: usize, value: usize) {
-        for i in 0..num_bits {
-            self.set_bit(data, bit_offset + i, (value >> i) & 1 == 1);
-        }
+    fn set_bits(&self, data: &mut u64, bit_offset: usize, num_bits: usize, value: usize) {
+        let mask = (1u64 << num_bits) - 1;
+        *data = (*data & !(mask << bit_offset)) | ((value as u64 & mask) << bit_offset);
     }
 
     /// Check if a wall is present at the given position
-    pub fn get_wall(&self, data: &[u8], row: usize, col: usize, orientation: usize) -> bool {
+    pub fn get_wall(&self, data: u64, row: usize, col: usize, orientation: usize) -> bool {
         let wall_index = self.wall_position_to_index(row, col, orientation);
         self.get_bit(data, self.walls_offset + wall_index)
     }
@@ -162,7 +147,7 @@ impl QBitRepr {
     /// Set a wall at the given position
     pub fn set_wall(
         &self,
-        data: &mut [u8],
+        data: &mut u64,
         row: usize,
         col: usize,
         orientation: usize,
@@ -173,14 +158,14 @@ impl QBitRepr {
     }
 
     /// Get a player's position
-    pub fn get_player_position(&self, data: &[u8], player: usize) -> (usize, usize) {
+    pub fn get_player_position(&self, data: u64, player: usize) -> (usize, usize) {
         debug_assert!(player < 2);
         let index = self.get_bits(data, self.player_pos_offsets[player], self.position_bits);
         self.index_to_position(index)
     }
 
     /// Set a player's position
-    pub fn set_player_position(&self, data: &mut [u8], player: usize, row: usize, col: usize) {
+    pub fn set_player_position(&self, data: &mut u64, player: usize, row: usize, col: usize) {
         debug_assert!(player < 2);
         let new_index = self.position_to_index(row, col);
         debug_assert!(new_index < self.num_player_positions);
@@ -193,7 +178,7 @@ impl QBitRepr {
     }
 
     /// Get player 1's remaining walls
-    pub fn get_walls_remaining(&self, data: &[u8], player: usize) -> usize {
+    pub fn get_walls_remaining(&self, data: u64, player: usize) -> usize {
         debug_assert!(player < 2);
         self.get_bits(
             data,
@@ -203,7 +188,7 @@ impl QBitRepr {
     }
 
     /// Set player 1's remaining walls
-    pub fn set_walls_remaining(&self, data: &mut [u8], player: usize, walls: usize) {
+    pub fn set_walls_remaining(&self, data: &mut u64, player: usize, walls: usize) {
         debug_assert!(player < 2);
         debug_assert!(walls <= self.max_walls);
         self.set_bits(
@@ -215,7 +200,7 @@ impl QBitRepr {
     }
 
     /// Get the current player (0 or 1)
-    pub fn get_current_player(&self, data: &[u8]) -> usize {
+    pub fn get_current_player(&self, data: u64) -> usize {
         if self.get_bit(data, self.current_player_offset) {
             1
         } else {
@@ -224,18 +209,18 @@ impl QBitRepr {
     }
 
     /// Set the current player
-    pub fn set_current_player(&self, data: &mut [u8], player: usize) {
+    pub fn set_current_player(&self, data: &mut u64, player: usize) {
         debug_assert!(player < 2);
         self.set_bit(data, self.current_player_offset, player == 1);
     }
 
     /// Get the number of completed steps
-    pub fn get_completed_steps(&self, data: &[u8]) -> usize {
+    pub fn get_completed_steps(&self, data: u64) -> usize {
         self.get_bits(data, self.completed_steps_offset, self.completed_steps_bits)
     }
 
     /// Set the number of completed steps
-    pub fn set_completed_steps(&self, data: &mut [u8], steps: usize) {
+    pub fn set_completed_steps(&self, data: &mut u64, steps: usize) {
         debug_assert!(steps <= self.max_steps);
         self.set_bits(
             data,
@@ -298,7 +283,7 @@ impl QBitRepr {
     }
 
     /// Display the board state as text art
-    pub fn print(&self, data: &[u8]) {
+    pub fn print(&self, data: u64) {
         println!("{}", self.display(data));
     }
 
@@ -310,7 +295,7 @@ impl QBitRepr {
     /// - '|' for vertical walls
     /// - '-' for horizontal walls
     /// - Metadata (steps, walls) shown on the right side
-    pub fn display(&self, data: &[u8]) -> String {
+    pub fn display(&self, data: u64) -> String {
         let mut output = String::new();
 
         // Get metadata
@@ -410,8 +395,8 @@ mod tests {
         // Walls remaining: ceil(log2(10)) = 4 bits each = 8 bits
         // Current player: 1 bit
         // Steps: ceil(log2(100)) = 7 bits
-        // Total: 32 + 10 + 8 + 1 + 7 = 58 bits = 8 bytes
-        assert_eq!(q.size_bytes(), 8);
+        // Total: 32 + 10 + 8 + 1 + 7 = 58 bits
+        assert_eq!(q.size_bits(), 58);
     }
 
     #[test]
@@ -422,8 +407,8 @@ mod tests {
         q.set_player_position(&mut data, 0, 0, 2);
         q.set_player_position(&mut data, 1, 4, 2);
 
-        assert_eq!(q.get_player_position(&data, 0), (0, 2));
-        assert_eq!(q.get_player_position(&data, 1), (4, 2));
+        assert_eq!(q.get_player_position(data, 0), (0, 2));
+        assert_eq!(q.get_player_position(data, 1), (4, 2));
     }
 
     #[test]
@@ -435,9 +420,9 @@ mod tests {
         q.set_wall(&mut data, 0, 0, WALL_VERTICAL, true);
         // Set vertical wall at (1, 1)
         q.set_wall(&mut data, 1, 1, WALL_VERTICAL, true);
-        assert!(q.get_wall(&data, 0, 0, WALL_VERTICAL));
-        assert!(q.get_wall(&data, 1, 1, WALL_VERTICAL));
-        assert!(!q.get_wall(&data, 0, 1, WALL_VERTICAL));
+        assert!(q.get_wall(data, 0, 0, WALL_VERTICAL));
+        assert!(q.get_wall(data, 1, 1, WALL_VERTICAL));
+        assert!(!q.get_wall(data, 0, 1, WALL_VERTICAL));
     }
 
     #[test]
@@ -446,7 +431,7 @@ mod tests {
         let mut data = q.create_data();
 
         q.set_walls_remaining(&mut data, 0, 10);
-        assert_eq!(q.get_walls_remaining(&data, 0), 10);
+        assert_eq!(q.get_walls_remaining(data, 0), 10);
     }
 
     #[test]
@@ -454,13 +439,13 @@ mod tests {
         let q = QBitRepr::new(5, 10, 100);
         let mut data = q.create_data();
 
-        assert_eq!(q.get_current_player(&data), 0);
+        assert_eq!(q.get_current_player(data), 0);
 
         q.set_current_player(&mut data, 1);
-        assert_eq!(q.get_current_player(&data), 1);
+        assert_eq!(q.get_current_player(data), 1);
 
         q.set_current_player(&mut data, 0);
-        assert_eq!(q.get_current_player(&data), 0);
+        assert_eq!(q.get_current_player(data), 0);
     }
 
     #[test]
@@ -468,10 +453,10 @@ mod tests {
         let q = QBitRepr::new(5, 10, 100);
         let mut data = q.create_data();
 
-        assert_eq!(q.get_completed_steps(&data), 0);
+        assert_eq!(q.get_completed_steps(data), 0);
 
         q.set_completed_steps(&mut data, 42);
-        assert_eq!(q.get_completed_steps(&data), 42);
+        assert_eq!(q.get_completed_steps(data), 42);
     }
 
     #[test]

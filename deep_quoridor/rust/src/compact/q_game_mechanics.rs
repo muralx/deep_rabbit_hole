@@ -61,7 +61,7 @@ impl QGameMechanics {
 
     /// Create initial game state
     #[allow(dead_code)]
-    pub fn create_initial_state(&self) -> Vec<u8> {
+    pub fn create_initial_state(&self) -> u64 {
         let mut data = self.repr.create_data();
         let board_size = self.repr.board_size();
 
@@ -90,7 +90,7 @@ impl QGameMechanics {
     /// Doesn't check that players can reach their goal still.
     pub fn is_wall_placement_free(
         &self,
-        data: &[u8],
+        data: u64,
         row: usize,
         col: usize,
         orientation: usize,
@@ -149,21 +149,21 @@ impl QGameMechanics {
 
     /// Place a wall (no validation - use is_wall_placement_valid first)
     #[inline]
-    pub fn place_wall(&self, data: &mut [u8], row: usize, col: usize, orientation: usize) {
+    pub fn place_wall(&self, data: &mut u64, row: usize, col: usize, orientation: usize) {
         self.repr.set_wall(data, row, col, orientation, true);
     }
 
     /// Remove a wall
     #[inline]
     #[allow(dead_code)]
-    pub fn remove_wall(&self, data: &mut [u8], row: usize, col: usize, orientation: usize) {
+    pub fn remove_wall(&self, data: &mut u64, row: usize, col: usize, orientation: usize) {
         self.repr.set_wall(data, row, col, orientation, false);
     }
 
     /// Check if there's a wall blocking movement between two adjacent cells
     fn is_wall_between(
         &self,
-        data: &[u8],
+        data: u64,
         from_row: usize,
         from_col: usize,
         to_row: usize,
@@ -264,7 +264,7 @@ impl QGameMechanics {
 
     /// Check if a player can reach their goal row using BFS.
     /// Uses a reusable BfsBuffer to avoid allocations.
-    fn can_reach_goal(&self, data: &[u8], player: usize, buf: &mut BfsBuffer) -> bool {
+    fn can_reach_goal(&self, data: u64, player: usize, buf: &mut BfsBuffer) -> bool {
         let board_size = self.repr.board_size();
         let goal_row = self.goal_rows[player];
 
@@ -328,27 +328,27 @@ impl QGameMechanics {
     /// Temporarily mutates `data` in-place (places then removes the wall) to avoid cloning.
     pub fn is_wall_placement_valid(
         &self,
-        data: &mut [u8],
+        data: &mut u64,
         row: usize,
         col: usize,
         orientation: usize,
         buf: &mut BfsBuffer,
     ) -> bool {
         // First check if placement is physically possible
-        if !self.is_wall_placement_free(data, row, col, orientation) {
+        if !self.is_wall_placement_free(*data, row, col, orientation) {
             return false;
         }
 
         // Temporarily place the wall, check reachability, then remove it
         self.place_wall(data, row, col, orientation);
-        let valid = self.can_reach_goal(data, 0, buf) && self.can_reach_goal(data, 1, buf);
+        let valid = self.can_reach_goal(*data, 0, buf) && self.can_reach_goal(*data, 1, buf);
         self.remove_wall(data, row, col, orientation);
 
         valid
     }
 
     /// Execute a move action
-    pub fn execute_move(&self, data: &mut [u8], player: usize, dest_row: usize, dest_col: usize) {
+    pub fn execute_move(&self, data: &mut u64, player: usize, dest_row: usize, dest_col: usize) {
         self.repr
             .set_player_position(data, player, dest_row, dest_col);
     }
@@ -356,7 +356,7 @@ impl QGameMechanics {
     /// Execute a wall placement action
     pub fn execute_wall_placement(
         &self,
-        data: &mut [u8],
+        data: &mut u64,
         player: usize,
         row: usize,
         col: usize,
@@ -365,40 +365,40 @@ impl QGameMechanics {
         self.place_wall(data, row, col, orientation);
 
         // Decrement walls remaining for the player
-        let current_walls = self.repr.get_walls_remaining(data, player);
+        let current_walls = self.repr.get_walls_remaining(*data, player);
 
         self.repr
             .set_walls_remaining(data, player, current_walls.saturating_sub(1));
     }
 
     /// Switch to the next player
-    pub fn switch_player(&self, data: &mut [u8]) {
-        let current = self.repr.get_current_player(data);
+    pub fn switch_player(&self, data: &mut u64) {
+        let current = self.repr.get_current_player(*data);
         self.repr.set_current_player(data, 1 - current);
 
         // Increment step counter
-        let steps = self.repr.get_completed_steps(data);
+        let steps = self.repr.get_completed_steps(*data);
         self.repr.set_completed_steps(data, steps + 1);
     }
 
     /// Check if a player has won
-    pub fn check_win(&self, data: &[u8], player: usize) -> bool {
+    pub fn check_win(&self, data: u64, player: usize) -> bool {
         let (row, _col) = self.repr.get_player_position(data, player);
         row == self.goal_rows[player]
     }
 
     /// Check if the game is a draw (max steps reached)
     #[allow(dead_code)]
-    pub fn is_draw(&self, data: &[u8]) -> bool {
+    pub fn is_draw(&self, data: u64) -> bool {
         self.repr.get_completed_steps(data) >= self.repr.max_steps()
     }
 
     /// Get all valid wall placements for the current player
-    pub fn get_valid_wall_placements(&self, data: &mut [u8]) -> Vec<(usize, usize, usize)> {
-        let current_player = self.repr.get_current_player(data);
+    pub fn get_valid_wall_placements(&self, data: &mut u64) -> Vec<(usize, usize, usize)> {
+        let current_player = self.repr.get_current_player(*data);
 
         // Check if player has walls remaining
-        let walls_remaining = self.repr.get_walls_remaining(data, current_player);
+        let walls_remaining = self.repr.get_walls_remaining(*data, current_player);
 
         if walls_remaining == 0 {
             return Vec::new();
@@ -422,7 +422,7 @@ impl QGameMechanics {
     }
 
     /// Get all valid moves for the current player
-    pub fn get_valid_moves(&self, data: &[u8]) -> Vec<(usize, usize)> {
+    pub fn get_valid_moves(&self, data: u64) -> Vec<(usize, usize)> {
         let current_player = self.repr.get_current_player(data);
         let board_size = self.repr.board_size();
 
@@ -581,11 +581,11 @@ impl QGameMechanics {
     }
 
     /// Display the board state as text art
-    pub fn print(&self, data: &[u8]) {
+    pub fn print(&self, data: u64) {
         println!("{}", self.display(data));
     }
 
-    pub fn display(&self, data: &[u8]) -> String {
+    pub fn display(&self, data: u64) -> String {
         self.repr.display(data)
     }
 }
@@ -596,97 +596,96 @@ mod tests {
 
     #[test]
     fn test_create_initial_state() {
-        let mechanics = QGameMechanics::new(9, 10, 100);
+        let mechanics = QGameMechanics::new(5, 10, 100);
         let state = mechanics.create_initial_state();
 
         // Check player positions
-        let (p1_row, p1_col) = mechanics.repr.get_player_position(&state, 0);
-        let (p2_row, p2_col) = mechanics.repr.get_player_position(&state, 1);
+        let (p1_row, p1_col) = mechanics.repr.get_player_position(state, 0);
+        let (p2_row, p2_col) = mechanics.repr.get_player_position(state, 1);
 
         assert_eq!(p1_row, 0); // Top
-        assert_eq!(p1_col, 4); // Center
-        assert_eq!(p2_row, 8); // Bottom
-        assert_eq!(p2_col, 4); // Center
+        assert_eq!(p1_col, 2); // Center
+        assert_eq!(p2_row, 4); // Bottom
+        assert_eq!(p2_col, 2); // Center
 
         // Check walls
-        assert_eq!(mechanics.repr.get_walls_remaining(&state, 0), 10);
-        assert_eq!(mechanics.repr.get_walls_remaining(&state, 0), 10);
+        assert_eq!(mechanics.repr.get_walls_remaining(state, 0), 10);
+        assert_eq!(mechanics.repr.get_walls_remaining(state, 0), 10);
 
         // Check current player
-        assert_eq!(mechanics.repr.get_current_player(&state), 0);
+        assert_eq!(mechanics.repr.get_current_player(state), 0);
     }
 
     #[test]
     fn test_wall_placement_overlap() {
-        let mechanics = QGameMechanics::new(9, 10, 100);
+        let mechanics = QGameMechanics::new(5, 10, 100);
         let mut state = mechanics.create_initial_state();
 
         // Place a wall
-        assert!(mechanics.is_wall_placement_free(&state, 4, 4, WALL_VERTICAL));
-        mechanics.place_wall(&mut state, 4, 4, WALL_VERTICAL);
+        assert!(mechanics.is_wall_placement_free(state, 2, 2, WALL_VERTICAL));
+        mechanics.place_wall(&mut state, 2, 2, WALL_VERTICAL);
 
         // Same position should not be free anymore
-        assert!(!mechanics.is_wall_placement_free(&state, 4, 4, WALL_VERTICAL));
+        assert!(!mechanics.is_wall_placement_free(state, 2, 2, WALL_VERTICAL));
 
         // Perpendicular position should not be free
-        assert!(!mechanics.is_wall_placement_free(&state, 4, 4, WALL_HORIZONTAL));
+        assert!(!mechanics.is_wall_placement_free(state, 2, 2, WALL_HORIZONTAL));
     }
 
     #[test]
     fn test_wall_placement_extension() {
-        let mechanics = QGameMechanics::new(9, 10, 100);
+        let mechanics = QGameMechanics::new(5, 10, 100);
         let mut state = mechanics.create_initial_state();
 
         // Place a vertical wall
-        mechanics.place_wall(&mut state, 4, 4, WALL_VERTICAL);
+        mechanics.place_wall(&mut state, 2, 2, WALL_VERTICAL);
 
         // Adjacent vertical walls should conflict
-        assert!(!mechanics.is_wall_placement_free(&state, 3, 4, WALL_VERTICAL));
-        assert!(!mechanics.is_wall_placement_free(&state, 5, 4, WALL_VERTICAL));
+        assert!(!mechanics.is_wall_placement_free(state, 1, 2, WALL_VERTICAL));
+        assert!(!mechanics.is_wall_placement_free(state, 3, 2, WALL_VERTICAL));
 
         // Non-adjacent should be fine
-        assert!(mechanics.is_wall_placement_free(&state, 2, 4, WALL_VERTICAL));
-        assert!(mechanics.is_wall_placement_free(&state, 6, 4, WALL_VERTICAL));
+        assert!(mechanics.is_wall_placement_free(state, 0, 2, WALL_VERTICAL));
     }
 
     #[test]
     fn test_win_condition() {
-        let mechanics = QGameMechanics::new(9, 10, 100);
+        let mechanics = QGameMechanics::new(5, 10, 100);
         let mut state = mechanics.create_initial_state();
 
         // Move player 1 to goal row
-        mechanics.execute_move(&mut state, 0, 8, 4);
-        assert!(mechanics.check_win(&state, 0));
-        assert!(!mechanics.check_win(&state, 1));
+        mechanics.execute_move(&mut state, 0, 4, 2);
+        assert!(mechanics.check_win(state, 0));
+        assert!(!mechanics.check_win(state, 1));
     }
 
     #[test]
     fn test_execute_wall_placement() {
-        let mechanics = QGameMechanics::new(9, 10, 100);
+        let mechanics = QGameMechanics::new(5, 10, 100);
         let mut state = mechanics.create_initial_state();
 
-        let initial_walls = mechanics.repr.get_walls_remaining(&state, 0);
-        mechanics.execute_wall_placement(&mut state, 0, 4, 4, WALL_VERTICAL);
+        let initial_walls = mechanics.repr.get_walls_remaining(state, 0);
+        mechanics.execute_wall_placement(&mut state, 0, 2, 2, WALL_VERTICAL);
 
         assert_eq!(
-            mechanics.repr.get_walls_remaining(&state, 0),
+            mechanics.repr.get_walls_remaining(state, 0),
             initial_walls - 1
         );
-        assert!(mechanics.repr.get_wall(&state, 4, 4, WALL_VERTICAL));
+        assert!(mechanics.repr.get_wall(state, 2, 2, WALL_VERTICAL));
     }
 
     #[test]
     fn test_switch_player() {
-        let mechanics = QGameMechanics::new(9, 10, 100);
+        let mechanics = QGameMechanics::new(5, 10, 100);
         let mut state = mechanics.create_initial_state();
 
-        assert_eq!(mechanics.repr.get_current_player(&state), 0);
-        assert_eq!(mechanics.repr.get_completed_steps(&state), 0);
+        assert_eq!(mechanics.repr.get_current_player(state), 0);
+        assert_eq!(mechanics.repr.get_completed_steps(state), 0);
 
         mechanics.switch_player(&mut state);
 
-        assert_eq!(mechanics.repr.get_current_player(&state), 1);
-        assert_eq!(mechanics.repr.get_completed_steps(&state), 1);
+        assert_eq!(mechanics.repr.get_current_player(state), 1);
+        assert_eq!(mechanics.repr.get_completed_steps(state), 1);
     }
 
     #[test]
@@ -711,19 +710,16 @@ mod tests {
 
     #[test]
     fn test_pathfinding_allows_valid_walls() {
-        let mechanics = QGameMechanics::new(9, 10, 100);
+        let mechanics = QGameMechanics::new(5, 10, 100);
         let mut state = mechanics.create_initial_state();
 
-        // Place a horizontal wall that doesn't block the path (leaves room to go around)
-        // Place walls with gaps (every other position) to avoid extension conflicts
-        for col in (0..6).step_by(2) {
-            mechanics.place_wall(&mut state, 4, col, WALL_HORIZONTAL);
-        }
+        // Place horizontal walls with a gap so players can still reach goals
+        mechanics.place_wall(&mut state, 2, 0, WALL_HORIZONTAL);
 
-        // This wall should still be valid because players can go around via the sides
-        let mut buf = BfsBuffer::new(9);
+        // This wall should still be valid because players can go around via the right side
+        let mut buf = BfsBuffer::new(5);
         let is_valid =
-            mechanics.is_wall_placement_valid(&mut state, 4, 7, WALL_HORIZONTAL, &mut buf);
+            mechanics.is_wall_placement_valid(&mut state, 2, 2, WALL_HORIZONTAL, &mut buf);
         assert!(
             is_valid,
             "Wall should be valid as players can still reach goals"
@@ -732,26 +728,26 @@ mod tests {
 
     #[test]
     fn test_can_reach_goal_direct() {
-        let mechanics = QGameMechanics::new(9, 10, 100);
+        let mechanics = QGameMechanics::new(5, 10, 100);
         let state = mechanics.create_initial_state();
-        let mut buf = BfsBuffer::new(9);
+        let mut buf = BfsBuffer::new(5);
 
         // Both players should be able to reach their goals in initial state
         assert!(
-            mechanics.can_reach_goal(&state, 0, &mut buf),
+            mechanics.can_reach_goal(state, 0, &mut buf),
             "Player 1 should reach goal"
         );
         assert!(
-            mechanics.can_reach_goal(&state, 1, &mut buf),
+            mechanics.can_reach_goal(state, 1, &mut buf),
             "Player 2 should reach goal"
         );
     }
 
     #[test]
     fn test_print() {
-        let mechanics = QGameMechanics::new(9, 10, 100);
+        let mechanics = QGameMechanics::new(5, 10, 100);
         let state = mechanics.create_initial_state();
-        mechanics.print(&state);
+        mechanics.print(state);
     }
 
     /// Helper to parse a board state from a string representation similar to Python tests.
@@ -772,7 +768,7 @@ mod tests {
         board_str: &str,
     ) -> (
         QGameMechanics,
-        Vec<u8>,
+        u64,
         Vec<(usize, usize)>,
         Vec<(usize, usize, usize)>,
     ) {
@@ -837,7 +833,7 @@ mod tests {
                             if row_n > 0
                                 && col_n < size - 1
                                 && mechanics.is_wall_placement_free(
-                                    &state,
+                                    state,
                                     row_n - 1,
                                     col_n,
                                     WALL_HORIZONTAL,
@@ -906,7 +902,7 @@ mod tests {
                             if ch == '|'
                                 && row_n < size - 1
                                 && mechanics.is_wall_placement_free(
-                                    &state,
+                                    state,
                                     row_n,
                                     wall_col_n,
                                     WALL_VERTICAL,
@@ -937,7 +933,7 @@ mod tests {
     fn test_pawn_movements(board_str: &str) {
         let (mechanics, state, expected_moves, _) = parse_board(board_str);
 
-        let actual_moves = mechanics.get_valid_moves(&state);
+        let actual_moves = mechanics.get_valid_moves(state);
 
         assert_eq!(
             actual_moves.len(),
@@ -947,7 +943,7 @@ mod tests {
             actual_moves.len(),
             expected_moves,
             actual_moves,
-            mechanics.display(&state),
+            mechanics.display(state),
         );
 
         for expected in &expected_moves {

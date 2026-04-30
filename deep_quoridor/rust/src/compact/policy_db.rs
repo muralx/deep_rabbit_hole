@@ -11,45 +11,8 @@ use std::path::Path;
 
 use super::q_game_mechanics::QGameMechanics;
 
-/// Maximum state size in bytes. Covers up to 9x9 boards with generous parameters.
-pub const MAX_STATE_BYTES: usize = 8;
-
-/// Fixed-size key for the transposition table, avoiding heap allocation.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct StateKey {
-    bytes: [u8; MAX_STATE_BYTES],
-    len: u8,
-}
-
-impl StateKey {
-    pub fn from_slice(data: &[u8]) -> Self {
-        assert!(
-            data.len() <= MAX_STATE_BYTES,
-            "State size {} exceeds MAX_STATE_BYTES {}",
-            data.len(),
-            MAX_STATE_BYTES
-        );
-        let mut bytes = [0u8; MAX_STATE_BYTES];
-        bytes[..data.len()].copy_from_slice(data);
-        Self {
-            bytes,
-            len: data.len() as u8,
-        }
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        &self.bytes[..self.len as usize]
-    }
-}
-
-impl std::hash::Hash for StateKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.as_slice().hash(state);
-    }
-}
-
 /// Transposition table type alias.
-pub type TranspositionTable = DashMap<StateKey, i8>;
+pub type TranspositionTable = DashMap<u64, i8>;
 
 /// SQLite-backed policy database for storing and querying pre-computed minimax values.
 pub struct PolicyDb {
@@ -107,13 +70,13 @@ impl PolicyDb {
     /// player's perspective (positive = good for the acting player).
     pub fn lookup_action_values(
         &self,
-        data: &[u8],
+        data: u64,
     ) -> Result<Option<(Vec<(u8, u8, u8)>, Vec<i32>)>, Box<dyn std::error::Error>> {
         let mechanics = &self.mechanics;
         let cp = mechanics.repr().get_current_player(data);
 
-        let mut data_mut = data.to_vec();
-        let moves = mechanics.get_valid_moves(&mut data_mut);
+        let mut data_mut = data;
+        let moves = mechanics.get_valid_moves(data_mut);
         let walls = mechanics.get_valid_wall_placements(&mut data_mut);
 
         let mut actions: Vec<(u8, u8, u8)> = moves
@@ -138,7 +101,7 @@ impl PolicyDb {
         let mut any_found = false;
 
         for &(row, col, action_type) in &actions {
-            let mut child_data = data.to_vec();
+            let mut child_data = data;
             let (r, c, t) = (row as usize, col as usize, action_type as usize);
             if action_type == 2 {
                 mechanics.execute_move(&mut child_data, cp, r, c);
@@ -147,11 +110,11 @@ impl PolicyDb {
             }
             mechanics.switch_player(&mut child_data);
 
-            let child_cp = mechanics.repr().get_current_player(&child_data);
+            let child_cp = mechanics.repr().get_current_player(child_data);
             let child_opponent = 1 - child_cp;
 
             // P0-perspective value for this child state.
-            let value_p0: i32 = if mechanics.check_win(&child_data, child_opponent) {
+            let value_p0: i32 = if mechanics.check_win(child_data, child_opponent) {
                 // child_opponent just won
                 any_found = true;
                 if child_opponent == 0 {
@@ -159,14 +122,16 @@ impl PolicyDb {
                 } else {
                     -1
                 }
-            } else if mechanics.repr().get_completed_steps(&child_data)
+            } else if mechanics.repr().get_completed_steps(child_data)
                 >= mechanics.repr().max_steps()
             {
                 any_found = true;
                 0
             } else {
-                let result: Result<i32, _> =
-                    stmt.query_row(rusqlite::params![child_data], |row| row.get(0));
+                let result: Result<i32, _> = stmt.query_row(
+                    rusqlite::params![child_data.to_le_bytes().as_ref()],
+                    |row| row.get(0),
+                );
                 match result {
                     Ok(v) => {
                         any_found = true;
@@ -233,8 +198,9 @@ impl PolicyDb {
 
     /// Fetch states and values by rowid.
     ///
-    /// Returns a list of `(state_bytes, value)` tuples for each found rowid.
-    pub fn fetch_states_by_rowid(&self, rowids: &[i64]) -> Result<Vec<(Vec<u8>, i32)>, Box<dyn std::error::Error>> {
+    /// Returns a list of `(state, value)` tuples for each found rowid, where
+    /// `state` is the u64 packed state.
+    pub fn fetch_states_by_rowid(&self, rowids: &[i64]) -> Result<Vec<(u64, i32)>, Box<dyn std::error::Error>> {
         if rowids.is_empty() {
             return Ok(Vec::new());
         }
@@ -242,7 +208,10 @@ impl PolicyDb {
         let sql = format!("SELECT state, value FROM policy WHERE rowid IN ({})", placeholders);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(rowids.iter()), |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i32>(1)?))
+            let bytes: Vec<u8> = row.get(0)?;
+            let mut arr = [0u8; 8];
+            arr[..bytes.len()].copy_from_slice(&bytes);
+            Ok((u64::from_le_bytes(arr), row.get::<_, i32>(1)?))
         })?;
         let mut results = Vec::with_capacity(rowids.len());
         for row in rows {
@@ -251,20 +220,24 @@ impl PolicyDb {
         Ok(results)
     }
 
-    /// Look up values for the given state blobs.
+    /// Look up values for the given states.
     ///
-    /// Returns a list of `(state_bytes, value)` for each state found in the DB.
+    /// Returns a list of `(state, value)` for each state found in the DB.
     /// States not present in the DB are omitted from the result.
-    pub fn lookup_values_by_state(&self, states: &[&[u8]]) -> Result<Vec<(Vec<u8>, i32)>, Box<dyn std::error::Error>> {
+    pub fn lookup_values_by_state(&self, states: &[u64]) -> Result<Vec<(u64, i32)>, Box<dyn std::error::Error>> {
         if states.is_empty() {
             return Ok(Vec::new());
         }
         let placeholders: String = std::iter::repeat("?").take(states.len()).collect::<Vec<_>>().join(",");
         let sql = format!("SELECT state, value FROM policy WHERE state IN ({})", placeholders);
         let mut stmt = self.conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::ToSql> = states.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let blobs: Vec<Vec<u8>> = states.iter().map(|s| s.to_le_bytes().to_vec()).collect();
+        let params: Vec<&dyn rusqlite::ToSql> = blobs.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
         let rows = stmt.query_map(params.as_slice(), |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i32>(1)?))
+            let bytes: Vec<u8> = row.get(0)?;
+            let mut arr = [0u8; 8];
+            arr[..bytes.len()].copy_from_slice(&bytes);
+            Ok((u64::from_le_bytes(arr), row.get::<_, i32>(1)?))
         })?;
         let mut results = Vec::with_capacity(states.len());
         for row in rows {
@@ -336,16 +309,14 @@ impl PolicyDb {
         {
             let mut stmt = tx.prepare("INSERT INTO policy (state, value) VALUES (?1, ?2)")?;
 
-            for item in entries.into_iter() {
-                let (key, value) = item;
-
-                let steps = mechanics.repr().get_completed_steps(key.as_slice());
+            for (key, value) in entries.into_iter() {
+                let steps = mechanics.repr().get_completed_steps(key);
                 if steps % step_interval != 0 {
                     continue;
                 }
 
                 // Store P0-absolute values (1=P0 wins, -1=P0 loses).
-                stmt.execute(params![key.as_slice(), value as i32])?;
+                stmt.execute(params![key.to_le_bytes().as_ref(), value as i32])?;
             }
             drop(stmt);
         }
@@ -367,8 +338,8 @@ impl PolicyDb {
 }
 
 /// Get all valid actions (moves + wall placements) for the current player.
-fn get_all_actions(mechanics: &QGameMechanics, data: &mut [u8]) -> Vec<(u8, u8, u8)> {
-    let moves = mechanics.get_valid_moves(data);
+fn get_all_actions(mechanics: &QGameMechanics, data: &mut u64) -> Vec<(u8, u8, u8)> {
+    let moves = mechanics.get_valid_moves(*data);
     let mut actions: Vec<(u8, u8, u8)> = moves
         .into_iter()
         .map(|(r, c)| (r as u8, c as u8, 2))
@@ -393,7 +364,7 @@ fn get_all_actions(mechanics: &QGameMechanics, data: &mut [u8]) -> Vec<(u8, u8, 
 /// transposition table for later export to a policy database.
 pub fn minimax(
     mechanics: &QGameMechanics,
-    data: &mut [u8],
+    data: &mut u64,
     transposition_table: &TranspositionTable,
 ) -> i8 {
     minimax_inner(mechanics, data, transposition_table, None)
@@ -401,27 +372,26 @@ pub fn minimax(
 
 fn minimax_inner(
     mechanics: &QGameMechanics,
-    data: &mut [u8],
+    data: &mut u64,
     transposition_table: &TranspositionTable,
     mut rng: Option<&mut StdRng>,
 ) -> i8 {
-    let key = StateKey::from_slice(data);
-    if let Some(entry) = transposition_table.get(&key) {
+    if let Some(entry) = transposition_table.get(data) {
         return *entry;
     }
 
-    let current_player = mechanics.repr().get_current_player(data);
+    let current_player = mechanics.repr().get_current_player(*data);
     let opponent = 1 - current_player;
 
     // Terminal states: return value directly without storing in transposition table.
-    if mechanics.check_win(data, opponent) {
+    if mechanics.check_win(*data, opponent) {
         return match opponent {
             0 => 1,
             1 => -1,
             _ => panic!("Bad player number ({})", opponent),
         };
     }
-    if mechanics.repr().get_completed_steps(data) >= mechanics.repr().max_steps() {
+    if mechanics.repr().get_completed_steps(*data) >= mechanics.repr().max_steps() {
         return 0;
     }
 
@@ -442,12 +412,12 @@ fn minimax_inner(
     let mut best_value: i8 = if is_maximizing { -1 } else { 1 };
 
     for &(row, col, action_type) in &actions {
-        let mut new_data = data.to_vec();
+        let mut new_data = *data;
         let (r, c, t) = (row as usize, col as usize, action_type as usize);
         if action_type == 2 {
             mechanics.execute_move(
                 &mut new_data,
-                mechanics.repr().get_current_player(data),
+                mechanics.repr().get_current_player(*data),
                 r,
                 c,
             );
@@ -475,7 +445,7 @@ fn minimax_inner(
         }
     }
 
-    transposition_table.insert(key, best_value);
+    transposition_table.insert(*data, best_value);
 
     best_value
 }
@@ -485,15 +455,15 @@ fn minimax_inner(
 /// transposition table. Returns the root value.
 pub fn minimax_lazy_smp(
     mechanics: &QGameMechanics,
-    data: &mut [u8],
+    data: &mut u64,
     transposition_table: &TranspositionTable,
     num_threads: usize,
 ) -> i8 {
-    let data_snapshot = data.to_vec();
+    let data_snapshot = *data;
     let result = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for i in 0..num_threads {
-            let mut thread_data = data_snapshot.clone();
+            let mut thread_data = data_snapshot;
             let tt = &transposition_table;
             let mech = &mechanics;
             handles.push(s.spawn(move || {
