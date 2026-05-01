@@ -416,7 +416,9 @@ fn policy_db_lookup<'py>(
 ) -> PyResult<Option<(Bound<'py, PyArray2<i32>>, Bound<'py, numpy::PyArray1<i32>>)>> {
     use compact::policy_db::PolicyDb;
 
-    let db = PolicyDb::open(db_path)
+    // One-shot per-move agent path: always lazy so a single move never
+    // pays the cost of loading the whole DB into RAM.
+    let db = PolicyDb::open(db_path, true)
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to open DB: {e}")))?;
 
     let mut data = db.mechanics().repr().create_data();
@@ -557,9 +559,16 @@ struct PyPolicyDb {
 #[cfg(feature = "python")]
 #[pymethods]
 impl PyPolicyDb {
+    /// Open a Parquet policy DB.
+    ///
+    /// `lazy=False` (default) loads the entire dataset into a HashMap at
+    /// open time for O(1) state lookups — best for training. `lazy=True`
+    /// keeps the file on disk and walks Parquet row groups on demand —
+    /// use this for DBs too large to fit in memory.
     #[new]
-    fn new(path: &str) -> PyResult<Self> {
-        let db = compact::policy_db::PolicyDb::open(path)
+    #[pyo3(signature = (path, lazy = false))]
+    fn new(path: &str, lazy: bool) -> PyResult<Self> {
+        let db = compact::policy_db::PolicyDb::open(path, lazy)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to open DB: {e}")))?;
         Ok(Self { db })
     }

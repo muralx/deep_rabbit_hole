@@ -362,7 +362,7 @@ def main():
     # ------------------------------------------------------------------
     # Open DB and read metadata
     # ------------------------------------------------------------------
-    db = quoridor_rs.PyPolicyDb(args.db_path)
+    db = quoridor_rs.PyPolicyDb(args.db_path, lazy=False)
     board_size, max_walls, max_steps, num_states = db.read_metadata()
     print(f"Board size: {board_size}, max_walls: {max_walls}, max_steps: {max_steps}")
 

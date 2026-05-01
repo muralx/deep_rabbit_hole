@@ -59,16 +59,31 @@ struct DecodedRowGroup {
     values: Vec<i8>,
 }
 
+/// Backing storage for an open PolicyDb. The lazy variant defers row-group
+/// decode until each lookup; the eager variant loads everything into RAM
+/// up front for O(1) state lookups and O(1) rowid access.
+enum Storage {
+    Lazy {
+        path: String,
+        metadata: ArrowReaderMetadata,
+        row_groups: Vec<RowGroupStats>,
+        /// `cum_rows[i]` = sum of `num_rows` over row groups `0..i`.
+        /// Length `row_groups.len() + 1`. `cum_rows.last()` = total rows.
+        cum_rows: Vec<u64>,
+    },
+    Eager {
+        /// File order (= sorted by state-as-i64). Indexable by `rowid - 1`.
+        ordered: Vec<(u64, i8)>,
+        /// O(1) point lookups for `lookup_values_by_state`.
+        table: HashMap<u64, i8>,
+    },
+}
+
 /// Parquet-backed policy database for storing and querying pre-computed
 /// minimax values. Single file per DB; sorted by `state` for efficient
 /// row-group pruning on point lookups.
 pub struct PolicyDb {
-    path: String,
-    metadata: ArrowReaderMetadata,
-    row_groups: Vec<RowGroupStats>,
-    /// `cum_rows[i]` = sum of `num_rows` over row groups `0..i`.
-    /// Length `row_groups.len() + 1`. `cum_rows.last()` = total rows.
-    cum_rows: Vec<u64>,
+    storage: Storage,
     mechanics: QGameMechanics,
     board_size: usize,
     max_walls: usize,
@@ -92,7 +107,13 @@ fn parse_meta(kv: Option<&Vec<KeyValue>>, key: &str) -> Option<usize> {
 
 impl PolicyDb {
     /// Open an existing policy database for reading.
-    pub fn open(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    ///
+    /// When `lazy` is `false` (the default for callers), the entire dataset
+    /// is decoded into a `HashMap<u64, i8>` at open time so subsequent
+    /// state lookups are O(1). When `lazy` is `true`, lookups walk Parquet
+    /// row groups on demand using the file's min/max statistics; useful for
+    /// DBs too large to fit in memory.
+    pub fn open(path: &str, lazy: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let file = File::open(Path::new(path))?;
         let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
 
@@ -134,11 +155,44 @@ impl PolicyDb {
         // Prefer the cached count from metadata, fall back to summed row counts.
         let num_states = num_states_meta.unwrap_or(total as usize);
 
+        let storage = if lazy {
+            Storage::Lazy {
+                path: path.to_string(),
+                metadata,
+                row_groups,
+                cum_rows,
+            }
+        } else {
+            // Eager load: walk all row groups in one pass, decoding each
+            // RecordBatch into the running ordered Vec, then build the
+            // O(1) lookup HashMap from it.
+            let file = File::open(Path::new(path))?;
+            let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                file,
+                metadata.clone(),
+            )
+            .build()?;
+
+            let mut state_buf: Vec<i64> = Vec::with_capacity(num_states);
+            let mut value_buf: Vec<i8> = Vec::with_capacity(num_states);
+            for batch in reader {
+                let batch = batch?;
+                append_batch(&batch, &mut state_buf, &mut value_buf)?;
+            }
+
+            let mut ordered: Vec<(u64, i8)> = Vec::with_capacity(state_buf.len());
+            for (s, v) in state_buf.into_iter().zip(value_buf.into_iter()) {
+                ordered.push((s as u64, v));
+            }
+            let mut table = HashMap::with_capacity(ordered.len());
+            for &(s, v) in &ordered {
+                table.insert(s, v);
+            }
+            Storage::Eager { ordered, table }
+        };
+
         Ok(Self {
-            path: path.to_string(),
-            metadata,
-            row_groups,
-            cum_rows,
+            storage,
             mechanics,
             board_size,
             max_walls,
@@ -166,19 +220,20 @@ impl PolicyDb {
 
     /// Decode a single row group into `(states, values)` columns.
     /// Reopens the file so this is safe to call from a `&self` context
-    /// without interior mutability or sync.
+    /// without interior mutability or sync. Lazy mode only.
     fn decode_row_group(
-        &self,
-        rg_idx: usize,
+        path: &str,
+        metadata: &ArrowReaderMetadata,
+        rg: &RowGroupStats,
     ) -> Result<DecodedRowGroup, Box<dyn std::error::Error>> {
-        let file = File::open(&self.path)?;
-        let mut reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, self.metadata.clone())
-            .with_row_groups(vec![rg_idx])
-            .with_batch_size(self.row_groups[rg_idx].num_rows as usize)
+        let file = File::open(path)?;
+        let mut reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata.clone())
+            .with_row_groups(vec![rg.idx])
+            .with_batch_size(rg.num_rows as usize)
             .build()?;
 
-        let mut states = Vec::with_capacity(self.row_groups[rg_idx].num_rows as usize);
-        let mut values = Vec::with_capacity(self.row_groups[rg_idx].num_rows as usize);
+        let mut states = Vec::with_capacity(rg.num_rows as usize);
+        let mut values = Vec::with_capacity(rg.num_rows as usize);
         while let Some(batch) = reader.next() {
             let batch = batch?;
             append_batch(&batch, &mut states, &mut values)?;
@@ -293,51 +348,86 @@ impl PolicyDb {
         if rowids.is_empty() {
             return Ok(Vec::new());
         }
-        let total_rows = *self.cum_rows.last().unwrap_or(&0);
 
-        let mut sorted: Vec<u64> = rowids
-            .iter()
-            .filter_map(|&r| {
-                if r >= 1 && (r as u64) <= total_rows {
-                    Some((r - 1) as u64)
-                } else {
-                    None
+        match &self.storage {
+            Storage::Eager { ordered, .. } => {
+                let total_rows = ordered.len() as u64;
+                let mut sorted: Vec<u64> = rowids
+                    .iter()
+                    .filter_map(|&r| {
+                        if r >= 1 && (r as u64) <= total_rows {
+                            Some((r - 1) as u64)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                sorted.sort_unstable();
+
+                let mut results = Vec::with_capacity(sorted.len());
+                for r0 in sorted {
+                    let (s, v) = ordered[r0 as usize];
+                    results.push((s, v as i32));
                 }
-            })
-            .collect();
-        sorted.sort_unstable();
-
-        let mut results = Vec::with_capacity(sorted.len());
-        let mut current_rg: Option<usize> = None;
-        let mut decoded: Option<DecodedRowGroup> = None;
-
-        for r0 in sorted {
-            // cum_rows is sorted ascending; find the row group whose range
-            // [cum_rows[i], cum_rows[i+1]) contains r0.
-            let rg_idx = match self.cum_rows.binary_search(&r0) {
-                Ok(i) => i,        // r0 is the first row of group i
-                Err(i) => i - 1,   // r0 falls in group i-1
-            };
-            let row_in_group = (r0 - self.cum_rows[rg_idx]) as usize;
-
-            if current_rg != Some(rg_idx) {
-                decoded = Some(self.decode_row_group(rg_idx)?);
-                current_rg = Some(rg_idx);
+                Ok(results)
             }
-            let dec = decoded.as_ref().unwrap();
-            let s = dec.states[row_in_group] as u64;
-            let v = dec.values[row_in_group] as i32;
-            results.push((s, v));
-        }
+            Storage::Lazy {
+                path,
+                metadata,
+                row_groups,
+                cum_rows,
+            } => {
+                let total_rows = *cum_rows.last().unwrap_or(&0);
+                let mut sorted: Vec<u64> = rowids
+                    .iter()
+                    .filter_map(|&r| {
+                        if r >= 1 && (r as u64) <= total_rows {
+                            Some((r - 1) as u64)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                sorted.sort_unstable();
 
-        Ok(results)
+                let mut results = Vec::with_capacity(sorted.len());
+                let mut current_rg: Option<usize> = None;
+                let mut decoded: Option<DecodedRowGroup> = None;
+
+                for r0 in sorted {
+                    // cum_rows is sorted ascending; find the row group whose
+                    // range [cum_rows[i], cum_rows[i+1]) contains r0.
+                    let rg_idx = match cum_rows.binary_search(&r0) {
+                        Ok(i) => i,        // r0 is the first row of group i
+                        Err(i) => i - 1,   // r0 falls in group i-1
+                    };
+                    let row_in_group = (r0 - cum_rows[rg_idx]) as usize;
+
+                    if current_rg != Some(rg_idx) {
+                        decoded = Some(Self::decode_row_group(
+                            path,
+                            metadata,
+                            &row_groups[rg_idx],
+                        )?);
+                        current_rg = Some(rg_idx);
+                    }
+                    let dec = decoded.as_ref().unwrap();
+                    let s = dec.states[row_in_group] as u64;
+                    let v = dec.values[row_in_group] as i32;
+                    results.push((s, v));
+                }
+
+                Ok(results)
+            }
+        }
     }
 
     /// Look up values for the given states.
     ///
     /// Returns `(state, value)` for each state found in the DB. States
-    /// not present are omitted. Internally walks row groups in sorted
-    /// order, decoding each at most once.
+    /// not present are omitted. In eager mode this is an O(N) HashMap
+    /// scan; in lazy mode it walks Parquet row groups in sorted order,
+    /// decoding each at most once.
     pub fn lookup_values_by_state(
         &self,
         states: &[u64],
@@ -345,41 +435,55 @@ impl PolicyDb {
         if states.is_empty() {
             return Ok(Vec::new());
         }
-        let mut sorted: Vec<i64> = states.iter().map(|&s| s as i64).collect();
-        sorted.sort_unstable();
-        sorted.dedup();
 
-        let mut results = Vec::new();
-        let mut q_idx = 0usize;
-        let mut rg_idx = 0usize;
+        match &self.storage {
+            Storage::Eager { table, .. } => Ok(states
+                .iter()
+                .filter_map(|s| table.get(s).map(|v| (*s, *v as i32)))
+                .collect()),
+            Storage::Lazy {
+                path,
+                metadata,
+                row_groups,
+                ..
+            } => {
+                let mut sorted: Vec<i64> = states.iter().map(|&s| s as i64).collect();
+                sorted.sort_unstable();
+                sorted.dedup();
 
-        while q_idx < sorted.len() && rg_idx < self.row_groups.len() {
-            let q = sorted[q_idx];
-            let rg = &self.row_groups[rg_idx];
+                let mut results = Vec::new();
+                let mut q_idx = 0usize;
+                let mut rg_idx = 0usize;
 
-            if q < rg.min {
-                // Sorted file: q can't appear in any later row group either.
-                q_idx += 1;
-            } else if q > rg.max {
-                rg_idx += 1;
-            } else {
-                // q is in [min, max]; decode this row group once and
-                // resolve every query whose value falls in the same range.
-                let decoded = self.decode_row_group(rg.idx)?;
-                while q_idx < sorted.len() && sorted[q_idx] <= rg.max {
-                    let q2 = sorted[q_idx];
-                    if q2 >= rg.min {
-                        if let Ok(pos) = decoded.states.binary_search(&q2) {
-                            results.push((q2 as u64, decoded.values[pos] as i32));
+                while q_idx < sorted.len() && rg_idx < row_groups.len() {
+                    let q = sorted[q_idx];
+                    let rg = &row_groups[rg_idx];
+
+                    if q < rg.min {
+                        // Sorted file: q can't appear in any later group either.
+                        q_idx += 1;
+                    } else if q > rg.max {
+                        rg_idx += 1;
+                    } else {
+                        // q is in [min, max]; decode this row group once and
+                        // resolve every query whose value falls in the range.
+                        let decoded = Self::decode_row_group(path, metadata, rg)?;
+                        while q_idx < sorted.len() && sorted[q_idx] <= rg.max {
+                            let q2 = sorted[q_idx];
+                            if q2 >= rg.min {
+                                if let Ok(pos) = decoded.states.binary_search(&q2) {
+                                    results.push((q2 as u64, decoded.values[pos] as i32));
+                                }
+                            }
+                            q_idx += 1;
                         }
+                        rg_idx += 1;
                     }
-                    q_idx += 1;
                 }
-                rg_idx += 1;
+
+                Ok(results)
             }
         }
-
-        Ok(results)
     }
 
     /// Create a new policy database from a transposition table.
@@ -705,7 +809,7 @@ mod tests {
         .unwrap();
         assert_eq!(written, expected.len());
 
-        let db = PolicyDb::open(path_str).unwrap();
+        let db = PolicyDb::open(path_str, false).unwrap();
         assert_eq!(
             db.read_metadata().unwrap(),
             (3, 0, 8, Some(expected.len()))
@@ -745,7 +849,7 @@ mod tests {
         let path_str = path.to_str().unwrap();
         PolicyDb::write(&mechanics, table, path_str, 3, 8, 0, 1).unwrap();
 
-        let db = PolicyDb::open(path_str).unwrap();
+        let db = PolicyDb::open(path_str, false).unwrap();
 
         // Construct a state where P0 is one row from goal — at least one
         // child action wins immediately (terminal child, no DB lookup).
@@ -765,5 +869,78 @@ mod tests {
             values.iter().any(|&v| v == 1),
             "expected at least one winning action value, got {values:?}"
         );
+    }
+
+    /// Eager and lazy modes must return identical results across all
+    /// public query methods.
+    #[test]
+    fn test_eager_matches_lazy() {
+        let mechanics = QGameMechanics::new(3, 0, 8);
+        let mut root = mechanics.create_initial_state();
+        let table = TranspositionTable::new();
+        minimax(&mechanics, &mut root, &table);
+        let expected: Vec<(u64, i8)> =
+            table.iter().map(|kv| (*kv.key(), *kv.value())).collect();
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.parquet");
+        let path_str = path.to_str().unwrap();
+        PolicyDb::write(&mechanics, table, path_str, 3, 8, 0, 1).unwrap();
+
+        let eager = PolicyDb::open(path_str, false).unwrap();
+        let lazy = PolicyDb::open(path_str, true).unwrap();
+
+        // Same metadata.
+        assert_eq!(eager.read_metadata().unwrap(), lazy.read_metadata().unwrap());
+        assert_eq!(eager.count_states().unwrap(), lazy.count_states().unwrap());
+
+        // Same lookup_values_by_state results (sort both since order isn't
+        // guaranteed across modes).
+        let states: Vec<u64> = expected.iter().map(|(s, _)| *s).collect();
+        let mut e_pairs = eager.lookup_values_by_state(&states).unwrap();
+        let mut l_pairs = lazy.lookup_values_by_state(&states).unwrap();
+        e_pairs.sort_unstable_by_key(|(s, _)| *s);
+        l_pairs.sort_unstable_by_key(|(s, _)| *s);
+        assert_eq!(e_pairs, l_pairs);
+        assert_eq!(e_pairs.len(), expected.len());
+
+        // Same fetch_states_by_rowid results in sequential order. Both
+        // modes return rows in ascending rowid order, which is by
+        // sorted-state order on disk.
+        let all_ids: Vec<i64> = (1..=expected.len() as i64).collect();
+        let e_by_id = eager.fetch_states_by_rowid(&all_ids).unwrap();
+        let l_by_id = lazy.fetch_states_by_rowid(&all_ids).unwrap();
+        assert_eq!(e_by_id, l_by_id);
+
+        // Same lookup_action_values: pick a non-terminal state from the
+        // table and compare the (actions, values) tuple. Use sorting
+        // since action enumeration order is identical but we sort to be
+        // robust against any future reordering.
+        let probe_state = expected
+            .iter()
+            .find(|(s, _)| {
+                !mechanics.check_win(*s, 0)
+                    && !mechanics.check_win(*s, 1)
+                    && mechanics.repr().get_completed_steps(*s) < mechanics.repr().max_steps()
+            })
+            .map(|(s, _)| *s)
+            .expect("expected at least one non-terminal state");
+
+        let (e_actions, e_values) = eager
+            .lookup_action_values(probe_state)
+            .unwrap()
+            .expect("eager: action values");
+        let (l_actions, l_values) = lazy
+            .lookup_action_values(probe_state)
+            .unwrap()
+            .expect("lazy: action values");
+
+        let mut e_pairs: Vec<((u8, u8, u8), i32)> =
+            e_actions.into_iter().zip(e_values).collect();
+        let mut l_pairs: Vec<((u8, u8, u8), i32)> =
+            l_actions.into_iter().zip(l_values).collect();
+        e_pairs.sort_unstable_by_key(|(a, _)| *a);
+        l_pairs.sort_unstable_by_key(|(a, _)| *a);
+        assert_eq!(e_pairs, l_pairs);
     }
 }
