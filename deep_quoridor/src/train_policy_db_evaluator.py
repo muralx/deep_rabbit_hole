@@ -163,101 +163,71 @@ def fetch_batch(db, ids, evaluator: NNEvaluator, board_size, max_walls, max_step
 
 
 # ---------------------------------------------------------------------------
-# Accuracy metric
+# Test metrics
 # ---------------------------------------------------------------------------
-
-
-@timer("compute_accuracy")
-def compute_accuracy(
-    test_ids, db, evaluator: NNEvaluator, board_size, max_walls, max_steps, num_samples, test_player=None
-):
-    """Fraction of sampled states where model picks the same best action as DB.
-
-    If test_player is 0 or 1, only states where the current player matches are counted.
-    """
-    assert len(test_ids) > 0
-    assert num_samples > 0
-    sample_ids = random.sample(test_ids, min(num_samples, len(test_ids)))
-
-    # Fetch the state blobs and values for the sampled test IDs.
-    rows = db.fetch_states_by_rowid(sample_ids)
-
-    correct = 0
-    total = 0
-    inaccurate_printed = 0
-    for state, _value in rows:
-        game = compact_state_to_game(state, board_size, max_walls, max_steps)
-        current_player = int(game.current_player)
-        if test_player is not None and current_player != test_player:
-            continue
-
-        db_policy = build_policy_from_action_values(
-            db,
-            state,
-            board_size,
-            evaluator.action_encoder.num_actions,
-        )
-
-        _, model_policy = evaluator.evaluate(game)
-
-        best_db_action_prob = max(db_policy)
-        model_pick = int(np.argmax(model_policy))
-        if db_policy[model_pick] == best_db_action_prob:
-            correct += 1
-        else:
-            if DEBUG and inaccurate_printed < 3:
-                inaccurate_printed += 1
-
-                print("")
-                print(game)
-                print(f"DB optimal actions: {policy_to_str(db_policy, evaluator.action_encoder)}")
-                print(f"Model optimal actions: {policy_to_str(model_policy, evaluator.action_encoder)}")
-
-        Timer.log_totals()
-        total += 1
-
-    return correct / total
 
 
 @timer("compute_test_metrics_batched")
 def compute_test_metrics_batched(
-    num_states, db, evaluator: NNEvaluator, board_size, max_walls, max_steps, batch_size, test_player=None
+    test_ids, db, evaluator: NNEvaluator, board_size, max_walls, max_steps, batch_size, test_player=None
 ):
-    """Compute test loss and accuracy over all states by iterating in batches.
+    """Iterate `test_ids` in chunks, emitting batches of exactly `batch_size`
+    samples (post player filter). Only the final batch may be smaller.
+
+    When `test_player` filtering drops samples below `batch_size`, we keep
+    fetching more `test_ids` and refilling a buffer until the batch is full
+    or `test_ids` is exhausted.
 
     Returns (policy_loss, value_loss, total_loss, accuracy) as floats.
     """
     total_pol = total_val = total_tot = 0.0
     correct = total = 0
 
-    for start in range(1, num_states + 1, batch_size):
-        print(f"Evaluating test batch {start} to {min(start + batch_size - 1, num_states)} out of {num_states}")
-        batch_ids = list(range(start, min(start + batch_size, num_states + 1)))
-        samples = fetch_batch(db, batch_ids, evaluator, board_size, max_walls, max_steps)
-        if test_player is not None:
-            samples = [s for s in samples if s["current_player"] == test_player]
-        assert samples is not None, "fetch_batch should never return None"
-        print("Batch size after filtering: ", len(samples))
+    n_test_ids = len(test_ids)
+    ids_idx = 0
+    buffer = []
 
-        n = len(samples)
-        if n == 0:
-            continue
-        pol, val, tot = evaluator.compute_losses(samples)
-        total_pol += pol.item() * n
-        total_val += val.item() * n
-        total_tot += tot.item() * n
+    evaluator.network.eval()
+    with torch.no_grad():
+        while ids_idx < n_test_ids or buffer:
+            # Top up the buffer until it has at least one full batch worth
+            # of samples (or test_ids is exhausted).
+            while len(buffer) < batch_size and ids_idx < n_test_ids:
+                end = min(ids_idx + batch_size, n_test_ids)
+                next_ids = test_ids[ids_idx:end]
+                ids_idx = end
+                new_samples = fetch_batch(
+                    db, next_ids, evaluator, board_size, max_walls, max_steps
+                )
+                if test_player is not None:
+                    new_samples = [s for s in new_samples if s["current_player"] == test_player]
+                buffer.extend(new_samples)
 
-        for s in samples:
-            original_game = compact_state_to_game(s["state"], board_size, max_walls, max_steps)
-            _, model_policy = evaluator.evaluate(original_game)
-            db_policy = s["db_policy_original"]
-            best_db_prob = max(db_policy)
-            model_pick = int(np.argmax(model_policy))
-            if db_policy[model_pick] == best_db_prob:
-                correct += 1
-            total += 1
+            # Emit a batch from the front of the buffer.
+            batch = buffer[:batch_size]
+            buffer = buffer[batch_size:]
+            n = len(batch)
+            if n == 0:
+                break
 
-        Timer.log_totals()
+            print(f"Evaluating test batch {total + 1}-{total + n} of ~{n_test_ids}")
+            pol, val, tot = evaluator.compute_losses(batch)
+            total_pol += pol.item() * n
+            total_val += val.item() * n
+            total_tot += tot.item() * n
+
+            for s in batch:
+                original_game = compact_state_to_game(s["state"], board_size, max_walls, max_steps)
+                _, model_policy = evaluator.evaluate(original_game)
+                db_policy = s["db_policy_original"]
+                best_db_prob = max(db_policy)
+                model_pick = int(np.argmax(model_policy))
+                if db_policy[model_pick] == best_db_prob:
+                    correct += 1
+                total += 1
+
+            Timer.log_totals()
+    evaluator.network.train()
 
     assert total > 0, "No test samples found (check test_player filter?)"
     return total_pol / total, total_val / total, total_tot / total, correct / total
@@ -284,12 +254,11 @@ def parse_args():
     p.add_argument(
         "--test-batch-size",
         type=int,
-        default=None,
-        help="If set, test on all states using sequential batches of this size (ignores --test-fraction and --exclude-test-set)",
+        default=256,
+        help="Per-batch sample count for test evaluation (only the last batch may be smaller)",
     )
     p.add_argument("--num-steps", type=int, default=10000)
     p.add_argument("--log-interval", type=int, default=200)
-    p.add_argument("--accuracy-states", type=int, default=200)
     p.add_argument("--output", default="evaluator.pt")
     p.add_argument("--device", default=None, help="cpu or cuda (default: auto)")
     p.add_argument(
@@ -385,14 +354,13 @@ def main():
     # ------------------------------------------------------------------
     # Train/test split by ID (IDs are 1-based, contiguous)
     # ------------------------------------------------------------------
-    if args.test_batch_size is not None:
-        test_id_set = None
-        print(f"Full-DB test mode: {num_states} states, test batch size {args.test_batch_size}")
-    else:
-        test_size = min(max(1, int(num_states * args.test_fraction)), MAX_TEST_SIZE)
-        test_id_set = set(random.sample(range(1, num_states + 1), test_size))
-        test_ids = sorted(test_id_set)
-        print(f"Train size: ~{num_states - test_size}, test size: {len(test_ids)}")
+    test_size = min(max(1, int(num_states * args.test_fraction)), MAX_TEST_SIZE)
+    test_id_set = set(random.sample(range(1, num_states + 1), test_size))
+    test_ids = sorted(test_id_set)
+    print(
+        f"Train size: ~{num_states - test_size}, test size: {len(test_ids)}, "
+        f"test batch size: {args.test_batch_size}"
+    )
 
     # ------------------------------------------------------------------
     # Create NNEvaluator and set up optimizer
@@ -402,19 +370,10 @@ def main():
     evaluator.train_prepare(az_params.learning_rate, az_params.batch_size, args.num_steps, az_params.weight_decay)
 
     # ------------------------------------------------------------------
-    # Pre-compute test samples (test set is small / capped)
+    # Probe one sample for feature_dim
     # ------------------------------------------------------------------
-    if args.test_batch_size is None:
-        print("Computing test features...")
-        test_samples = fetch_batch(db, test_ids, evaluator, board_size, max_walls, max_steps)
-        if test_player is not None:
-            test_samples = [s for s in test_samples if s["current_player"] == test_player]
-            print(f"Filtered test set to {len(test_samples)} states for player {args.test_player}")
-        feature_dim = test_samples[0]["input_array"].shape[0]
-    else:
-        test_samples = None
-        probe = fetch_batch(db, [1], evaluator, board_size, max_walls, max_steps)
-        feature_dim = probe[0]["input_array"].shape[0]
+    probe = fetch_batch(db, [test_ids[0]], evaluator, board_size, max_walls, max_steps)
+    feature_dim = probe[0]["input_array"].shape[0]
     print(f"Feature dim: {feature_dim}")
 
     if use_wandb:
@@ -424,8 +383,8 @@ def main():
                 "max_walls": max_walls,
                 "max_steps": max_steps,
                 "num_states": num_states,
-                "train_size": num_states if args.test_batch_size is not None else num_states - test_size,
-                "test_size": num_states if args.test_batch_size is not None else len(test_samples),
+                "train_size": num_states - test_size,
+                "test_size": len(test_ids),
                 "feature_dim": feature_dim,
             }
         )
@@ -482,38 +441,16 @@ def main():
             )
 
         if step % args.log_interval == 0 or step == 1:
-            if args.test_batch_size is not None:
-                test_policy_loss, test_value_loss, test_total_loss, acc = compute_test_metrics_batched(
-                    num_states,
-                    db,
-                    evaluator,
-                    board_size,
-                    max_walls,
-                    max_steps,
-                    args.test_batch_size,
-                    test_player=test_player,
-                )
-            else:
-                evaluator.network.eval()
-                with torch.no_grad():
-                    test_policy_loss, test_value_loss, test_total_loss = evaluator.compute_losses(test_samples)
-                    test_policy_loss = test_policy_loss.item()
-                    test_value_loss = test_value_loss.item()
-                    test_total_loss = test_total_loss.item()
-                evaluator.network.train()
-
-                Timer.log_totals()
-
-                acc = compute_accuracy(
-                    test_ids,
-                    db,
-                    evaluator,
-                    board_size,
-                    max_walls,
-                    max_steps,
-                    args.accuracy_states,
-                    test_player=test_player,
-                )
+            test_policy_loss, test_value_loss, test_total_loss, acc = compute_test_metrics_batched(
+                test_ids,
+                db,
+                evaluator,
+                board_size,
+                max_walls,
+                max_steps,
+                args.test_batch_size,
+                test_player=test_player,
+            )
 
             print(
                 f"step {step:6d} | "
