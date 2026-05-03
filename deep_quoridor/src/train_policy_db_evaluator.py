@@ -132,12 +132,14 @@ def fetch_batch(db, ids, evaluator: NNEvaluator, board_size, max_walls, max_step
         )
         db_policy_original = mcts_policy.copy()
 
+        Timer.start("game_rotation_and_features")
         # Do the rotation, in the same way AlphaZeroAgent.store_training_data() does
         game, is_rotated = evaluator.rotate_if_needed_to_point_downwards(game)
         input_array = evaluator.game_to_input_array(game)
         action_mask = game.get_action_mask()
         if is_rotated:
             mcts_policy = evaluator.rotate_policy_from_original(mcts_policy)
+        Timer.finish("game_rotation_and_features")
 
         if DEBUG:
             print("")
@@ -228,32 +230,34 @@ def compute_test_metrics_batched(
     total_pol = total_val = total_tot = 0.0
     correct = total = 0
 
-    evaluator.network.eval()
-    with torch.no_grad():
-        for start in range(1, num_states + 1, batch_size):
-            batch_ids = list(range(start, min(start + batch_size, num_states + 1)))
-            samples = fetch_batch(db, batch_ids, evaluator, board_size, max_walls, max_steps)
-            if test_player is not None:
-                samples = [s for s in samples if s["current_player"] == test_player]
-            assert samples is not None, "fetch_batch should never return None"
+    for start in range(1, num_states + 1, batch_size):
+        print(f"Evaluating test batch {start} to {min(start + batch_size - 1, num_states)} out of {num_states}")
+        batch_ids = list(range(start, min(start + batch_size, num_states + 1)))
+        samples = fetch_batch(db, batch_ids, evaluator, board_size, max_walls, max_steps)
+        if test_player is not None:
+            samples = [s for s in samples if s["current_player"] == test_player]
+        assert samples is not None, "fetch_batch should never return None"
+        print("Batch size after filtering: ", len(samples))
 
-            n = len(samples)
-            pol, val, tot = evaluator.compute_losses(samples)
-            total_pol += pol.item() * n
-            total_val += val.item() * n
-            total_tot += tot.item() * n
+        n = len(samples)
+        if n == 0:
+            continue
+        pol, val, tot = evaluator.compute_losses(samples)
+        total_pol += pol.item() * n
+        total_val += val.item() * n
+        total_tot += tot.item() * n
 
-            for s in samples:
-                original_game = compact_state_to_game(s["state"], board_size, max_walls, max_steps)
-                _, model_policy = evaluator.evaluate(original_game)
-                db_policy = s["db_policy_original"]
-                best_db_prob = max(db_policy)
-                model_pick = int(np.argmax(model_policy))
-                if db_policy[model_pick] == best_db_prob:
-                    correct += 1
-                total += 1
+        for s in samples:
+            original_game = compact_state_to_game(s["state"], board_size, max_walls, max_steps)
+            _, model_policy = evaluator.evaluate(original_game)
+            db_policy = s["db_policy_original"]
+            best_db_prob = max(db_policy)
+            model_pick = int(np.argmax(model_policy))
+            if db_policy[model_pick] == best_db_prob:
+                correct += 1
+            total += 1
 
-    evaluator.network.train()
+        Timer.log_totals()
 
     assert total > 0, "No test samples found (check test_player filter?)"
     return total_pol / total, total_val / total, total_tot / total, correct / total
