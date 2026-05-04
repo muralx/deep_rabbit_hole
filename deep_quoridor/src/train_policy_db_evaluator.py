@@ -17,6 +17,7 @@ import os
 import random
 import sys
 from dataclasses import asdict
+from pathlib import Path
 
 import numpy as np
 import quoridor_rs
@@ -232,6 +233,34 @@ def compute_test_metrics_batched(
 
 
 # ---------------------------------------------------------------------------
+# DB source resolution
+# ---------------------------------------------------------------------------
+
+
+def resolve_db_path(db_path: str) -> str:
+    """If `db_path` is `wandb:<entity>/<project>/<name>:<alias>`, fetch the
+    artifact and return the local path to the `.parquet` file inside it.
+    Otherwise return `db_path` unchanged. wandb's API caches downloads in
+    `~/.cache/wandb/` so repeat invocations are local-disk cheap.
+    """
+    if not db_path.startswith("wandb:"):
+        return db_path
+    artifact_ref = db_path[len("wandb:"):]
+    print(f"Fetching wandb artifact: {artifact_ref}")
+    api = wandb.Api()
+    artifact = api.artifact(artifact_ref, type="policy_db")
+    download_dir = artifact.download()
+    parquet_files = list(Path(download_dir).glob("*.parquet"))
+    if len(parquet_files) != 1:
+        raise RuntimeError(
+            f"Expected exactly one .parquet in artifact {artifact_ref}, "
+            f"found {parquet_files}"
+        )
+    print(f"Using downloaded DB: {parquet_files[0]}")
+    return str(parquet_files[0])
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -240,7 +269,13 @@ MAX_TEST_SIZE = 10000
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train a neural network evaluator from a policy DB.")
-    p.add_argument("db_path", help="Path to .sqlite policy DB")
+    p.add_argument(
+        "db_path",
+        help=(
+            "Path to a .parquet policy DB, or "
+            "'wandb:<entity>/<project>/<name>:<alias>' to fetch from a wandb artifact"
+        ),
+    )
     p.add_argument(
         "-p",
         "--params",
@@ -333,7 +368,8 @@ def main():
     # ------------------------------------------------------------------
     # Open DB and read metadata
     # ------------------------------------------------------------------
-    db = quoridor_rs.PyPolicyDb(args.db_path, lazy=False)
+    db_path = resolve_db_path(args.db_path)
+    db = quoridor_rs.PyPolicyDb(db_path, lazy=False)
     board_size, max_walls, max_steps, num_states = db.read_metadata()
     print(f"Board size: {board_size}, max_walls: {max_walls}, max_steps: {max_steps}")
 
