@@ -575,25 +575,29 @@ impl PyPolicyDb {
 
     /// Read metadata: returns (board_size, max_walls, max_steps, num_states).
     fn read_metadata(&self) -> PyResult<(usize, usize, usize, Option<usize>)> {
-        self.db.read_metadata()
+        self.db
+            .read_metadata()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
     }
 
     /// Count total states in the policy table.
     fn count_states(&self) -> PyResult<usize> {
-        self.db.count_states()
+        self.db
+            .count_states()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
     }
 
     /// Fetch (state, value) tuples by rowid. State is a u64 packed integer.
     fn fetch_states_by_rowid(&self, rowids: Vec<i64>) -> PyResult<Vec<(u64, i32)>> {
-        self.db.fetch_states_by_rowid(&rowids)
+        self.db
+            .fetch_states_by_rowid(&rowids)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
     }
 
     /// Look up (state, value) for the given states.
     fn lookup_values_by_state(&self, states: Vec<u64>) -> PyResult<Vec<(u64, i32)>> {
-        self.db.lookup_values_by_state(&states)
+        self.db
+            .lookup_values_by_state(&states)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
     }
 
@@ -603,7 +607,8 @@ impl PyPolicyDb {
     /// (actions, values) where actions is a list of (row, col, action_type)
     /// and values are from the acting player's perspective.
     fn lookup_action_values(&self, state: u64) -> PyResult<Option<(Vec<(u8, u8, u8)>, Vec<i32>)>> {
-        self.db.lookup_action_values(state)
+        self.db
+            .lookup_action_values(state)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
     }
 }

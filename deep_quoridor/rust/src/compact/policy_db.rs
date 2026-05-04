@@ -118,12 +118,12 @@ impl PolicyDb {
         let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
 
         let kv = metadata.metadata().file_metadata().key_value_metadata();
-        let board_size = parse_meta(kv, "board_size")
-            .ok_or("missing board_size in parquet metadata")?;
-        let max_walls = parse_meta(kv, "max_walls")
-            .ok_or("missing max_walls in parquet metadata")?;
-        let max_steps = parse_meta(kv, "max_steps")
-            .ok_or("missing max_steps in parquet metadata")?;
+        let board_size =
+            parse_meta(kv, "board_size").ok_or("missing board_size in parquet metadata")?;
+        let max_walls =
+            parse_meta(kv, "max_walls").ok_or("missing max_walls in parquet metadata")?;
+        let max_steps =
+            parse_meta(kv, "max_steps").ok_or("missing max_steps in parquet metadata")?;
         let num_states_meta = parse_meta(kv, "num_states");
 
         let mechanics = QGameMechanics::new(board_size, max_walls, max_steps);
@@ -137,17 +137,27 @@ impl PolicyDb {
         for i in 0..num_row_groups {
             let rg = pq_meta.row_group(i);
             let num_rows = rg.num_rows() as u64;
-            let stats = rg.column(0).statistics().ok_or_else(|| {
-                format!("row group {i} missing statistics on state column")
-            })?;
+            let stats = rg
+                .column(0)
+                .statistics()
+                .ok_or_else(|| format!("row group {i} missing statistics on state column"))?;
             let (min, max) = match stats {
                 Statistics::Int64(s) => (
                     *s.min_opt().ok_or("missing min stat on state")?,
                     *s.max_opt().ok_or("missing max stat on state")?,
                 ),
-                _ => return Err(format!("unexpected stats variant for state column: {stats:?}").into()),
+                _ => {
+                    return Err(
+                        format!("unexpected stats variant for state column: {stats:?}").into(),
+                    )
+                }
             };
-            row_groups.push(RowGroupStats { idx: i, min, max, num_rows });
+            row_groups.push(RowGroupStats {
+                idx: i,
+                min,
+                max,
+                num_rows,
+            });
             total += num_rows;
             cum_rows.push(total);
         }
@@ -167,11 +177,8 @@ impl PolicyDb {
             // RecordBatch into the running ordered Vec, then build the
             // O(1) lookup HashMap from it.
             let file = File::open(Path::new(path))?;
-            let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
-                file,
-                metadata.clone(),
-            )
-            .build()?;
+            let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata.clone())
+                .build()?;
 
             let mut state_buf: Vec<i64> = Vec::with_capacity(num_states);
             let mut value_buf: Vec<i8> = Vec::with_capacity(num_states);
@@ -210,7 +217,12 @@ impl PolicyDb {
     pub fn read_metadata(
         &self,
     ) -> Result<(usize, usize, usize, Option<usize>), Box<dyn std::error::Error>> {
-        Ok((self.board_size, self.max_walls, self.max_steps, Some(self.num_states)))
+        Ok((
+            self.board_size,
+            self.max_walls,
+            self.max_steps,
+            Some(self.num_states),
+        ))
     }
 
     /// Count the total number of states.
@@ -260,7 +272,11 @@ impl PolicyDb {
             .into_iter()
             .map(|(r, c)| (r as u8, c as u8, 2))
             .collect();
-        actions.extend(walls.into_iter().map(|(r, c, t)| (r as u8, c as u8, t as u8)));
+        actions.extend(
+            walls
+                .into_iter()
+                .map(|(r, c, t)| (r as u8, c as u8, t as u8)),
+        );
 
         if actions.is_empty() {
             return Ok(None);
@@ -398,17 +414,14 @@ impl PolicyDb {
                     // cum_rows is sorted ascending; find the row group whose
                     // range [cum_rows[i], cum_rows[i+1]) contains r0.
                     let rg_idx = match cum_rows.binary_search(&r0) {
-                        Ok(i) => i,        // r0 is the first row of group i
-                        Err(i) => i - 1,   // r0 falls in group i-1
+                        Ok(i) => i,      // r0 is the first row of group i
+                        Err(i) => i - 1, // r0 falls in group i-1
                     };
                     let row_in_group = (r0 - cum_rows[rg_idx]) as usize;
 
                     if current_rg != Some(rg_idx) {
-                        decoded = Some(Self::decode_row_group(
-                            path,
-                            metadata,
-                            &row_groups[rg_idx],
-                        )?);
+                        decoded =
+                            Some(Self::decode_row_group(path, metadata, &row_groups[rg_idx])?);
                         current_rg = Some(rg_idx);
                     }
                     let dec = decoded.as_ref().unwrap();
@@ -551,7 +564,10 @@ impl PolicyDb {
             let values: Vec<i8> = chunk.iter().map(|(_, v)| *v).collect();
             let batch = RecordBatch::try_new(
                 schema.clone(),
-                vec![Arc::new(Int64Array::from(states)), Arc::new(Int8Array::from(values))],
+                vec![
+                    Arc::new(Int64Array::from(states)),
+                    Arc::new(Int8Array::from(values)),
+                ],
             )?;
             writer.write(&batch)?;
         }
@@ -791,29 +807,22 @@ mod tests {
         assert!(!table.is_empty());
 
         // Snapshot expected entries before write() drains the DashMap.
-        let expected: Vec<(u64, i8)> =
-            table.iter().map(|kv| (*kv.key(), *kv.value())).collect();
+        let expected: Vec<(u64, i8)> = table.iter().map(|kv| (*kv.key(), *kv.value())).collect();
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.parquet");
         let path_str = path.to_str().unwrap();
         let written = PolicyDb::write(
-            &mechanics,
-            table,
-            path_str,
-            3,    // board_size
-            8,    // max_steps
-            0,    // max_walls
-            1,    // step_interval (keep all)
+            &mechanics, table, path_str, 3, // board_size
+            8, // max_steps
+            0, // max_walls
+            1, // step_interval (keep all)
         )
         .unwrap();
         assert_eq!(written, expected.len());
 
         let db = PolicyDb::open(path_str, false).unwrap();
-        assert_eq!(
-            db.read_metadata().unwrap(),
-            (3, 0, 8, Some(expected.len()))
-        );
+        assert_eq!(db.read_metadata().unwrap(), (3, 0, 8, Some(expected.len())));
         assert_eq!(db.count_states().unwrap(), expected.len());
 
         // Round-trip every entry by state lookup.
@@ -879,8 +888,7 @@ mod tests {
         let mut root = mechanics.create_initial_state();
         let table = TranspositionTable::new();
         minimax(&mechanics, &mut root, &table);
-        let expected: Vec<(u64, i8)> =
-            table.iter().map(|kv| (*kv.key(), *kv.value())).collect();
+        let expected: Vec<(u64, i8)> = table.iter().map(|kv| (*kv.key(), *kv.value())).collect();
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.parquet");
@@ -891,7 +899,10 @@ mod tests {
         let lazy = PolicyDb::open(path_str, true).unwrap();
 
         // Same metadata.
-        assert_eq!(eager.read_metadata().unwrap(), lazy.read_metadata().unwrap());
+        assert_eq!(
+            eager.read_metadata().unwrap(),
+            lazy.read_metadata().unwrap()
+        );
         assert_eq!(eager.count_states().unwrap(), lazy.count_states().unwrap());
 
         // Same lookup_values_by_state results (sort both since order isn't
@@ -935,10 +946,8 @@ mod tests {
             .unwrap()
             .expect("lazy: action values");
 
-        let mut e_pairs: Vec<((u8, u8, u8), i32)> =
-            e_actions.into_iter().zip(e_values).collect();
-        let mut l_pairs: Vec<((u8, u8, u8), i32)> =
-            l_actions.into_iter().zip(l_values).collect();
+        let mut e_pairs: Vec<((u8, u8, u8), i32)> = e_actions.into_iter().zip(e_values).collect();
+        let mut l_pairs: Vec<((u8, u8, u8), i32)> = l_actions.into_iter().zip(l_values).collect();
         e_pairs.sort_unstable_by_key(|(a, _)| *a);
         l_pairs.sort_unstable_by_key(|(a, _)| *a);
         assert_eq!(e_pairs, l_pairs);
