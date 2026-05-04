@@ -196,9 +196,7 @@ def compute_test_metrics_batched(
                 end = min(ids_idx + batch_size, n_test_ids)
                 next_ids = test_ids[ids_idx:end]
                 ids_idx = end
-                new_samples = fetch_batch(
-                    db, next_ids, evaluator, board_size, max_walls, max_steps
-                )
+                new_samples = fetch_batch(db, next_ids, evaluator, board_size, max_walls, max_steps)
                 if test_player is not None:
                     new_samples = [s for s in new_samples if s["current_player"] == test_player]
                 buffer.extend(new_samples)
@@ -210,7 +208,6 @@ def compute_test_metrics_batched(
             if n == 0:
                 break
 
-            print(f"Evaluating test batch {total + 1}-{total + n} of ~{n_test_ids}")
             pol, val, tot = evaluator.compute_losses(batch)
             total_pol += pol.item() * n
             total_val += val.item() * n
@@ -218,10 +215,7 @@ def compute_test_metrics_batched(
 
             # Run model inference for the whole batch at once so accuracy
             # picks the same code path the deployed agent uses.
-            games = [
-                compact_state_to_game(s["state"], board_size, max_walls, max_steps)
-                for s in batch
-            ]
+            games = [compact_state_to_game(s["state"], board_size, max_walls, max_steps) for s in batch]
             _, model_policies = evaluator.evaluate_batch(games)
             for s, model_policy in zip(batch, model_policies):
                 db_policy = s["db_policy_original"]
@@ -231,7 +225,6 @@ def compute_test_metrics_batched(
                     correct += 1
                 total += 1
 
-            Timer.log_totals()
     evaluator.network.train()
 
     assert total > 0, "No test samples found (check test_player filter?)"
@@ -362,10 +355,7 @@ def main():
     test_size = min(max(1, int(num_states * args.test_fraction)), MAX_TEST_SIZE)
     test_id_set = set(random.sample(range(1, num_states + 1), test_size))
     test_ids = sorted(test_id_set)
-    print(
-        f"Train size: ~{num_states - test_size}, test size: {len(test_ids)}, "
-        f"test batch size: {args.test_batch_size}"
-    )
+    print(f"Train size: ~{num_states - test_size}, test size: {len(test_ids)}, test batch size: {args.test_batch_size}")
 
     # ------------------------------------------------------------------
     # Create NNEvaluator and set up optimizer
@@ -410,7 +400,6 @@ def main():
         )
 
     for step in range(1, args.num_steps + 1):
-        print(f"Step {step}/{args.num_steps}")
         if step % 100000 == 0:
             learning_rate = learning_rate / 2.0
             print(f"Lowering learning rate to {learning_rate}")
@@ -488,6 +477,8 @@ def main():
                     },
                     args.output,
                 )
+
+        Timer.log_cumulative("step", step)
 
     print(f"Training complete. Best test loss: {best_test_loss:.4f}. Model saved to {args.output}")
 
