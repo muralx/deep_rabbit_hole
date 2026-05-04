@@ -216,9 +216,14 @@ def compute_test_metrics_batched(
             total_val += val.item() * n
             total_tot += tot.item() * n
 
-            for s in batch:
-                original_game = compact_state_to_game(s["state"], board_size, max_walls, max_steps)
-                _, model_policy = evaluator.evaluate(original_game)
+            # Run model inference for the whole batch at once so accuracy
+            # picks the same code path the deployed agent uses.
+            games = [
+                compact_state_to_game(s["state"], board_size, max_walls, max_steps)
+                for s in batch
+            ]
+            _, model_policies = evaluator.evaluate_batch(games)
+            for s, model_policy in zip(batch, model_policies):
                 db_policy = s["db_policy_original"]
                 best_db_prob = max(db_policy)
                 model_pick = int(np.argmax(model_policy))
