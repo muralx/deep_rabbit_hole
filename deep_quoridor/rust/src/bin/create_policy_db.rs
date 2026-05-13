@@ -35,8 +35,8 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     step_interval: usize,
 
-    /// Output SQLite database file path
-    #[arg(short, long, default_value = "policy_db.sqlite")]
+    /// Output Parquet database file path
+    #[arg(short, long, default_value = "policy_db.parquet")]
     output: String,
 }
 
@@ -53,14 +53,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut initial_state = mechanics.create_initial_state();
 
     // Print game state info
-    let current_player = mechanics.repr().get_current_player(&initial_state);
-    let (p0_row, p0_col) = mechanics.repr().get_player_position(&initial_state, 0);
-    let (p1_row, p1_col) = mechanics.repr().get_player_position(&initial_state, 1);
-    let p0_walls = mechanics.repr().get_walls_remaining(&initial_state, 0);
-    let p1_walls = mechanics.repr().get_walls_remaining(&initial_state, 1);
+    let current_player = mechanics.repr().get_current_player(initial_state);
+    let (p0_row, p0_col) = mechanics.repr().get_player_position(initial_state, 0);
+    let (p1_row, p1_col) = mechanics.repr().get_player_position(initial_state, 1);
+    let p0_walls = mechanics.repr().get_walls_remaining(initial_state, 0);
+    let p1_walls = mechanics.repr().get_walls_remaining(initial_state, 1);
 
     println!("\nGame state:");
-    println!("  State size: {} bytes", initial_state.len());
+    println!("  State size: {} bits", mechanics.repr().size_bits());
     println!(
         "  Player positions: [({}, {}), ({}, {})]",
         p0_row, p0_col, p1_row, p1_col

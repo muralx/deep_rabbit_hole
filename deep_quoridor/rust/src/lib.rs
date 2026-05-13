@@ -370,7 +370,7 @@ fn q_evaluate_actions<'py>(
     // Evaluate actions using QBitRepr minimax
     let (actions, values, _logs) = compact::q_minimax::evaluate_actions(
         &mechanics,
-        &data,
+        data,
         max_search_depth,
         branching_factor,
         discount_factor,
@@ -409,18 +409,20 @@ fn policy_db_lookup<'py>(
     walls_remaining: PyReadonlyArray1<i32>,
     current_player: i32,
     completed_steps: i32,
-    board_size: usize,
-    max_walls: usize,
-    max_steps: usize,
+    _board_size: usize,
+    _max_walls: usize,
+    _max_steps: usize,
     db_path: &str,
 ) -> PyResult<Option<(Bound<'py, PyArray2<i32>>, Bound<'py, numpy::PyArray1<i32>>)>> {
     use compact::policy_db::PolicyDb;
-    use compact::q_game_mechanics::QGameMechanics;
 
-    let mechanics = QGameMechanics::new(board_size, max_walls, max_steps);
+    // One-shot per-move agent path: always lazy so a single move never
+    // pays the cost of loading the whole DB into RAM.
+    let db = PolicyDb::open(db_path, true)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to open DB: {e}")))?;
 
-    let mut data = mechanics.repr().create_data();
-    mechanics.repr().from_game_state(
+    let mut data = db.mechanics().repr().create_data();
+    db.mechanics().repr().from_game_state(
         &mut data,
         &grid.as_array(),
         &player_positions.as_array(),
@@ -429,11 +431,8 @@ fn policy_db_lookup<'py>(
         completed_steps,
     );
 
-    let db = PolicyDb::open(db_path)
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to open DB: {e}")))?;
-
     match db
-        .lookup_action_values(&mechanics, &data)
+        .lookup_action_values(data)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("DB query error: {e}")))?
     {
         None => Ok(None),
@@ -462,7 +461,7 @@ fn policy_db_lookup<'py>(
 #[pyfunction]
 fn compact_state_to_game_state<'py>(
     py: Python<'py>,
-    state: &[u8],
+    state: u64,
     board_size: usize,
     max_walls: usize,
     max_steps: usize,
@@ -516,23 +515,23 @@ fn compact_state_to_game_state<'py>(
 #[cfg(feature = "python")]
 #[pyfunction]
 fn get_compact_child_states(
-    state: &[u8],
+    state: u64,
     board_size: usize,
     max_walls: usize,
     max_steps: usize,
-) -> Vec<(usize, usize, usize, Vec<u8>)> {
+) -> Vec<(usize, usize, usize, u64)> {
     use compact::q_game_mechanics::QGameMechanics;
 
     let mechanics = QGameMechanics::new(board_size, max_walls, max_steps);
     let current_player = mechanics.repr().get_current_player(state);
-    let mut data = state.to_vec();
+    let mut data = state;
 
     let mut children = Vec::new();
 
     // Pawn moves (action_type = 2)
-    let moves = mechanics.get_valid_moves(&data);
+    let moves = mechanics.get_valid_moves(data);
     for (row, col) in moves {
-        let mut child = data.clone();
+        let mut child = data;
         mechanics.execute_move(&mut child, current_player, row, col);
         mechanics.switch_player(&mut child);
         children.push((row, col, 2usize, child));
@@ -541,13 +540,91 @@ fn get_compact_child_states(
     // Wall placements (action_type = 0 or 1)
     let wall_placements = mechanics.get_valid_wall_placements(&mut data);
     for (row, col, orientation) in wall_placements {
-        let mut child = data.clone();
+        let mut child = data;
         mechanics.execute_wall_placement(&mut child, current_player, row, col, orientation);
         mechanics.switch_player(&mut child);
         children.push((row, col, orientation, child));
     }
 
     children
+}
+
+/// Python wrapper around PolicyDb for database access from Python.
+#[cfg(feature = "python")]
+#[pyclass]
+struct PyPolicyDb {
+    db: compact::policy_db::PolicyDb,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PyPolicyDb {
+    /// Open a Parquet policy DB.
+    ///
+    /// `lazy=False` (default) loads the entire dataset into a HashMap at
+    /// open time for O(1) state lookups — best for training. `lazy=True`
+    /// keeps the file on disk and walks Parquet row groups on demand —
+    /// use this for DBs too large to fit in memory.
+    #[new]
+    #[pyo3(signature = (path, lazy = false))]
+    fn new(path: &str, lazy: bool) -> PyResult<Self> {
+        let db = compact::policy_db::PolicyDb::open(path, lazy)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to open DB: {e}")))?;
+        Ok(Self { db })
+    }
+
+    /// Read metadata: returns (board_size, max_walls, max_steps, num_states).
+    fn read_metadata(&self) -> PyResult<(usize, usize, usize, Option<usize>)> {
+        self.db
+            .read_metadata()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+    }
+
+    /// Count total states in the policy table.
+    fn count_states(&self) -> PyResult<usize> {
+        self.db
+            .count_states()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+    }
+
+    /// Fetch (state, value) tuples by rowid. State is a u64 packed integer.
+    fn fetch_states_by_rowid(&self, rowids: Vec<i64>) -> PyResult<Vec<(u64, i32)>> {
+        self.db
+            .fetch_states_by_rowid(&rowids)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+    }
+
+    /// Look up (state, value) for the given states.
+    fn lookup_values_by_state(&self, states: Vec<u64>) -> PyResult<Vec<(u64, i32)>> {
+        self.db
+            .lookup_values_by_state(&states)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+    }
+
+    /// Look up action values for a compact state.
+    ///
+    /// Returns None if no valid actions, otherwise returns
+    /// (actions, values) where actions is a list of (row, col, action_type)
+    /// and values are from the acting player's perspective.
+    fn lookup_action_values(&self, state: u64) -> PyResult<Option<(Vec<(u8, u8, u8)>, Vec<i32>)>> {
+        self.db
+            .lookup_action_values(state)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+    }
+}
+
+/// Return a text-art display string for a compact state.
+#[cfg(feature = "python")]
+#[pyfunction]
+fn compact_state_display(
+    state: u64,
+    board_size: usize,
+    max_walls: usize,
+    max_steps: usize,
+) -> String {
+    use compact::q_bit_repr::QBitRepr;
+    let repr = QBitRepr::new(board_size, max_walls, max_steps);
+    repr.display(state)
 }
 
 /// A Python module implemented in Rust.
@@ -588,6 +665,10 @@ fn quoridor_rs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Compact state utilities for training
     m.add_function(wrap_pyfunction!(compact_state_to_game_state, m)?)?;
     m.add_function(wrap_pyfunction!(get_compact_child_states, m)?)?;
+    m.add_function(wrap_pyfunction!(compact_state_display, m)?)?;
+
+    // PolicyDb class
+    m.add_class::<PyPolicyDb>()?;
 
     // Export constants to match qgrid.py
     m.add("CELL_FREE", grid::CELL_FREE)?;
