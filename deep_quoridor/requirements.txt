@@ -1,7 +1,7 @@
 gymnasium
 maturin
 matplotlib
-numba
+numba<=0.61
 numpy
 open_spiel
 pettingzoo
