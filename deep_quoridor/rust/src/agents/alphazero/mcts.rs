@@ -6,8 +6,10 @@ use std::collections::HashSet;
 
 use rand_distr::{Dirichlet, Distribution};
 
-use crate::actions::{action_index_to_action, action_to_index};
-use crate::game_state::GameState;
+use crate::actions::action_index_to_action;
+#[cfg(test)]
+use crate::actions::action_to_index;
+use crate::compact::q_game_mechanics::QGameMechanics;
 
 use super::evaluator::Evaluator;
 
@@ -58,12 +60,12 @@ pub struct ChildInfo {
 /// A node in the MCTS tree.
 #[derive(Debug)]
 pub struct Node {
-    /// The game state at this node. None for lazily expanded nodes.
-    pub game: Option<GameState>,
+    /// The compact game state at this node.
+    pub data: u64,
     /// Parent node index in the arena, None for root.
     pub parent: Option<usize>,
-    /// Action taken from parent to reach this node.
-    pub action_taken: Option<[i32; 3]>,
+    /// Flat policy index for the action taken from parent to reach this node.
+    pub action_index: Option<usize>,
     /// Child node indices in the arena.
     pub children: Vec<usize>,
     /// Number of times this node was visited.
@@ -80,11 +82,11 @@ pub struct Node {
 
 impl Node {
     /// Create a new root node.
-    pub fn new_root(game: GameState) -> Self {
+    pub fn new_root(data: u64) -> Self {
         Self {
-            game: Some(game),
+            data,
             parent: None,
-            action_taken: None,
+            action_index: None,
             children: Vec::new(),
             visit_count: 0,
             value_sum: 0.0,
@@ -94,12 +96,12 @@ impl Node {
         }
     }
 
-    /// Create a new child node (lazy - game state computed on demand).
-    pub fn new_child(parent: usize, action: [i32; 3], prior: f32) -> Self {
+    /// Create a new child node with its (already computed) state.
+    pub fn new_child(parent: usize, action_index: usize, data: u64, prior: f32) -> Self {
         Self {
-            game: None,
+            data,
             parent: Some(parent),
-            action_taken: Some(action),
+            action_index: Some(action_index),
             children: Vec::new(),
             visit_count: 0,
             value_sum: 0.0,
@@ -131,15 +133,22 @@ pub struct NodeArena {
 
 impl NodeArena {
     /// Create a new arena with a root node.
-    pub fn new(root_game: GameState) -> Self {
-        let root = Node::new_root(root_game);
+    pub fn new(root_data: u64) -> Self {
+        let root = Node::new_root(root_data);
         Self { nodes: vec![root] }
     }
 
     /// Allocate a new child node and return its index.
-    pub fn alloc_child(&mut self, parent: usize, action: [i32; 3], prior: f32) -> usize {
+    pub fn alloc_child(
+        &mut self,
+        parent: usize,
+        action_index: usize,
+        data: u64,
+        prior: f32,
+    ) -> usize {
         let idx = self.nodes.len();
-        self.nodes.push(Node::new_child(parent, action, prior));
+        self.nodes
+            .push(Node::new_child(parent, action_index, data, prior));
         idx
     }
 
@@ -153,47 +162,31 @@ impl NodeArena {
         &mut self.nodes[idx]
     }
 
-    /// Get the game state for a node, computing it lazily if needed.
-    pub fn get_or_create_game(&mut self, idx: usize) -> &GameState {
-        // First check if we already have it
-        if self.nodes[idx].game.is_some() {
-            return self.nodes[idx].game.as_ref().unwrap();
-        }
-
-        // Need to compute it from parent
-        let parent_idx = self.nodes[idx]
-            .parent
-            .expect("Non-root node must have parent");
-        let action = self.nodes[idx]
-            .action_taken
-            .expect("Child node must have action");
-
-        // Recursively ensure parent has game state
-        let parent_game = self.get_or_create_game(parent_idx).clone();
-
-        // Apply action to get child game state
-        let child_game = parent_game.clone_and_step(action);
-        self.nodes[idx].game = Some(child_game);
-
-        self.nodes[idx].game.as_ref().unwrap()
-    }
-
     /// Get the number of nodes.
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 }
 
-/// Expand a node by creating children for all valid actions.
-pub fn expand_node(arena: &mut NodeArena, node_idx: usize, priors: &[f32], board_size: i32) {
-    // Create children only for actions with non-zero prior
-    for (action_idx, &prior) in priors.iter().enumerate() {
-        if prior > 1e-10 {
-            let action = action_index_to_action(board_size, action_idx);
-            let child_idx = arena.alloc_child(node_idx, action, prior);
-            arena.get_mut(node_idx).children.push(child_idx);
-        }
-    }
+/// Expand a node by creating children for all actions with non-zero prior.
+pub fn expand_node(
+    arena: &mut NodeArena,
+    node_idx: usize,
+    priors: &[f32],
+    mechanics: &QGameMechanics,
+) {
+    let parent_data = arena.get(node_idx).data;
+    let new_children: Vec<usize> = priors
+        .iter()
+        .enumerate()
+        .filter(|(_, &p)| p > 1e-10)
+        .map(|(action_idx, &prior)| {
+            let mut child_data = parent_data;
+            mechanics.apply_action_index(&mut child_data, action_idx);
+            arena.alloc_child(node_idx, action_idx, child_data, prior)
+        })
+        .collect();
+    arena.get_mut(node_idx).children.extend(new_children);
 }
 
 /// Select the best child using PUCT formula.
@@ -204,7 +197,6 @@ pub fn select_child(
     node_idx: usize,
     ucb_c: f32,
     visited_states: &HashSet<u64>,
-    _board_size: i32,
 ) -> usize {
     let node = arena.get(node_idx);
     let parent_visits = node.visit_count.max(1) as f32;
@@ -220,21 +212,10 @@ pub fn select_child(
         let u = ucb_c * child.prior * (parent_visits.sqrt()) / (1.0 + child.visit_count as f32);
         let mut ucb = q + u;
 
-        // Apply penalty if child state is in visited set (only when enabled)
-        // NOTE: If the penalized_visited_states flag is false, the agent will pass an empty set, so this check will have no effect.
-        if !visited_states.is_empty() {
-            if let Some(ref game) = child.game {
-                if visited_states.contains(&game.get_fast_hash()) {
-                    ucb -= 1.0;
-                }
-            } else if let Some(action) = child.action_taken {
-                // Compute hash for child without fully expanding game
-                let parent_game = arena.get(node_idx).game.as_ref().unwrap();
-                let child_game = parent_game.clone_and_step(action);
-                if visited_states.contains(&child_game.get_fast_hash()) {
-                    ucb -= 1.0;
-                }
-            }
+        // Penalty when this child's state is in the visited set.
+        // Set is empty when penalize_visited_states is false.
+        if !visited_states.is_empty() && visited_states.contains(&child.data) {
+            ucb -= 1.0;
         }
 
         if ucb > best_ucb {
@@ -313,19 +294,20 @@ pub fn apply_dirichlet_noise(priors: &mut [f32], epsilon: f32, alpha: f32) {
 /// Run MCTS search and return child information.
 pub fn search<E: Evaluator>(
     config: &MCTSConfig,
-    game: GameState,
+    root_data: u64,
+    mechanics: &QGameMechanics,
     evaluator: &mut E,
     visited_states: &HashSet<u64>,
 ) -> anyhow::Result<(Vec<ChildInfo>, f32)> {
-    let board_size = game.board_size;
-    let mut arena = NodeArena::new(game.clone());
+    let bs = mechanics.repr().board_size() as i32;
+    let mut arena = NodeArena::new(root_data);
 
     // Evaluate root upfront to get root_value and priors.
     // Root is NOT expanded here; expansion happens inside the first loop iteration
     // so that the loop structure matches the Python implementation (where iteration 0
     // always selects root itself, expands it, and backpropagates through it).
-    let action_mask = game.get_action_mask();
-    let (root_value, mut root_priors) = evaluator.evaluate(&game, &action_mask)?;
+    let action_mask = mechanics.get_action_mask_immut(root_data);
+    let (root_value, mut root_priors) = evaluator.evaluate(root_data, mechanics, &action_mask)?;
 
     // Apply Dirichlet noise at root if configured
     if config.noise_epsilon > 0.0 {
@@ -344,7 +326,7 @@ pub fn search<E: Evaluator>(
 
     // Special case: n=0 means just use priors (expand root once without simulating)
     if n_iterations == 0 {
-        expand_node(&mut arena, 0, &root_priors, board_size);
+        expand_node(&mut arena, 0, &root_priors, mechanics);
         let root = arena.get(0);
         let children = root.children.clone();
 
@@ -364,22 +346,15 @@ pub fn search<E: Evaluator>(
             let mut current_idx = 0;
 
             while !arena.get(current_idx).should_expand() {
-                current_idx = select_child(
-                    &arena,
-                    current_idx,
-                    config.ucb_c,
-                    visited_states,
-                    board_size,
-                );
+                current_idx = select_child(&arena, current_idx, config.ucb_c, visited_states);
             }
 
-            // Get/create game state for the selected node
-            let leaf_game = arena.get_or_create_game(current_idx).clone();
+            let leaf_data = arena.get(current_idx).data;
 
             // Check for terminal state
-            if leaf_game.is_game_over() {
+            if mechanics.is_game_over(leaf_data) {
                 // Terminal: backpropagate result
-                let value = if leaf_game.winner().is_some() {
+                let value = if mechanics.winner(leaf_data).is_some() {
                     1.0
                 } else {
                     0.0
@@ -390,7 +365,7 @@ pub fn search<E: Evaluator>(
 
             // Check max steps
             if let Some(max) = config.max_steps {
-                if leaf_game.completed_steps >= max as usize {
+                if mechanics.repr().get_completed_steps(leaf_data) >= max as usize {
                     backpropagate_result(&mut arena, current_idx, 0.0);
                     continue;
                 }
@@ -402,11 +377,11 @@ pub fn search<E: Evaluator>(
             let (value, leaf_priors) = if let Some(pre_priors) = root_priors_opt.take() {
                 (root_value, pre_priors)
             } else {
-                let leaf_mask = leaf_game.get_action_mask();
-                evaluator.evaluate(&leaf_game, &leaf_mask)?
+                let leaf_mask = mechanics.get_action_mask_immut(leaf_data);
+                evaluator.evaluate(leaf_data, mechanics, &leaf_mask)?
             };
 
-            expand_node(&mut arena, current_idx, &leaf_priors, board_size);
+            expand_node(&mut arena, current_idx, &leaf_priors, mechanics);
 
             // Backpropagate negative value (from opponent's perspective)
             backpropagate(&mut arena, current_idx, -value as f64);
@@ -426,11 +401,11 @@ pub fn search<E: Evaluator>(
         .iter()
         .map(|&child_idx| {
             let child = arena.get(child_idx);
-            let action = child.action_taken.unwrap();
-            let action_index = action_to_index(board_size, &action);
+            let ai = child.action_index.expect("child node must have action_index");
+            let action = action_index_to_action(bs, ai);
             ChildInfo {
                 action,
-                action_index,
+                action_index: ai,
                 visit_count: child.visit_count,
             }
         })
@@ -458,7 +433,8 @@ mod tests {
     impl Evaluator for MockEvaluator {
         fn evaluate(
             &mut self,
-            _state: &GameState,
+            _data: u64,
+            _mechanics: &QGameMechanics,
             action_mask: &[bool],
         ) -> Result<(f32, Vec<f32>)> {
             // Return uniform priors over valid actions
@@ -476,12 +452,18 @@ mod tests {
         }
     }
 
+    fn make_mech_state() -> (QGameMechanics, u64) {
+        let mech = QGameMechanics::new(5, 3, 200);
+        let data = mech.create_initial_state();
+        (mech, data)
+    }
+
     #[test]
     fn test_node_creation() {
-        let state = GameState::new(5, 3);
-        let node = Node::new_root(state);
+        let (_, data) = make_mech_state();
+        let node = Node::new_root(data);
 
-        assert!(node.game.is_some());
+        assert_eq!(node.data, data);
         assert!(node.parent.is_none());
         assert!(node.children.is_empty());
         assert_eq!(node.visit_count, 0);
@@ -491,37 +473,60 @@ mod tests {
 
     #[test]
     fn test_expand_node() {
-        let state = GameState::new(5, 3);
-        let mut arena = NodeArena::new(state);
+        let (mech, data) = make_mech_state();
+        let mut arena = NodeArena::new(data);
 
-        // Create uniform priors with some zeros
-        let priors = vec![0.0, 0.5, 0.0, 0.3, 0.2];
+        // Build sparse priors aligned to the policy layout
+        let total = crate::actions::policy_size(5);
+        let mask = mech.get_action_mask_immut(data);
+        let mut priors = vec![0.0f32; total];
+        // Put non-zero prior on three valid actions
+        let mut count = 0;
+        for (i, &v) in mask.iter().enumerate() {
+            if v {
+                priors[i] = if count == 0 {
+                    0.5
+                } else if count == 1 {
+                    0.3
+                } else if count == 2 {
+                    0.2
+                } else {
+                    0.0
+                };
+                count += 1;
+                if count == 3 {
+                    break;
+                }
+            }
+        }
 
-        expand_node(&mut arena, 0, &priors, 5);
+        expand_node(&mut arena, 0, &priors, &mech);
 
         let root = arena.get(0);
-        // Should have 3 children (for non-zero priors)
         assert_eq!(root.children.len(), 3);
-
-        // Verify children have correct priors
-        let child_priors: Vec<f32> = root
-            .children
-            .iter()
-            .map(|&idx| arena.get(idx).prior)
-            .collect();
-        assert!((child_priors[0] - 0.5).abs() < 1e-6);
-        assert!((child_priors[1] - 0.3).abs() < 1e-6);
-        assert!((child_priors[2] - 0.2).abs() < 1e-6);
     }
 
     #[test]
     fn test_select_child_ucb() {
-        let state = GameState::new(5, 3);
-        let mut arena = NodeArena::new(state);
+        let (mech, data) = make_mech_state();
+        let mut arena = NodeArena::new(data);
 
-        // Manually create children with different visit counts and values
-        let child1 = arena.alloc_child(0, [1, 2, 2], 0.5);
-        let child2 = arena.alloc_child(0, [0, 2, 2], 0.5);
+        // Find a couple of valid move action indices to use
+        let mask = mech.get_action_mask_immut(data);
+        let valid: Vec<usize> = mask
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| if v { Some(i) } else { None })
+            .collect();
+        assert!(valid.len() >= 2);
+
+        // Manually create two children
+        let mut d1 = data;
+        mech.apply_action_index(&mut d1, valid[0]);
+        let mut d2 = data;
+        mech.apply_action_index(&mut d2, valid[1]);
+        let child1 = arena.alloc_child(0, valid[0], d1, 0.5);
+        let child2 = arena.alloc_child(0, valid[1], d2, 0.5);
 
         arena.get_mut(0).children = vec![child1, child2];
         arena.get_mut(0).visit_count = 10;
@@ -535,28 +540,25 @@ mod tests {
         arena.get_mut(child2).value_sum = 0.0;
 
         let visited = HashSet::new();
-        let selected = select_child(&arena, 0, 1.4, &visited, 5);
+        let selected = select_child(&arena, 0, 1.4, &visited);
 
-        // Child 2 should be selected (higher UCB due to fewer visits)
         assert_eq!(selected, child2);
     }
 
     #[test]
     fn test_backpropagate() {
-        let state = GameState::new(5, 3);
-        let mut arena = NodeArena::new(state);
+        let (_, data) = make_mech_state();
+        let mut arena = NodeArena::new(data);
 
-        // Create a chain: root -> child -> grandchild
-        let child = arena.alloc_child(0, [1, 2, 2], 0.5);
-        let grandchild = arena.alloc_child(child, [2, 2, 2], 0.5);
+        // Chain: root -> child -> grandchild (arbitrary action indices, data doesn't matter here)
+        let child = arena.alloc_child(0, 0, data, 0.5);
+        let grandchild = arena.alloc_child(child, 0, data, 0.5);
 
         arena.get_mut(0).children = vec![child];
         arena.get_mut(child).children = vec![grandchild];
 
-        // Backpropagate +1 from grandchild
         backpropagate(&mut arena, grandchild, 1.0);
 
-        // Check values alternate
         assert_eq!(arena.get(grandchild).visit_count, 1);
         assert!((arena.get(grandchild).value_sum - 1.0).abs() < 1e-6);
 
@@ -569,13 +571,12 @@ mod tests {
 
     #[test]
     fn test_backpropagate_result_tracks_wins_losses() {
-        let state = GameState::new(5, 3);
-        let mut arena = NodeArena::new(state);
+        let (_, data) = make_mech_state();
+        let mut arena = NodeArena::new(data);
 
-        let child = arena.alloc_child(0, [1, 2, 2], 0.5);
+        let child = arena.alloc_child(0, 0, data, 0.5);
         arena.get_mut(0).children = vec![child];
 
-        // Backpropagate a win
         backpropagate_result(&mut arena, child, 1.0);
 
         assert_eq!(arena.get(child).wins, 1);
@@ -586,44 +587,60 @@ mod tests {
 
     #[test]
     fn test_visited_state_penalty() {
-        let state = GameState::new(5, 0); // No walls for simpler moves
-        let mut arena = NodeArena::new(state.clone());
+        let mech = QGameMechanics::new(5, 0, 200);
+        let data = mech.create_initial_state();
+        let mut arena = NodeArena::new(data);
 
-        // Create two children
-        let child1 = arena.alloc_child(0, [1, 2, 2], 0.5);
-        let child2 = arena.alloc_child(0, [0, 1, 2], 0.5);
-
+        // Two valid move children
+        let mask = mech.get_action_mask_immut(data);
+        let valid: Vec<usize> = mask
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| if v { Some(i) } else { None })
+            .collect();
+        let mut d1 = data;
+        mech.apply_action_index(&mut d1, valid[0]);
+        let mut d2 = data;
+        mech.apply_action_index(&mut d2, valid[1]);
+        let child1 = arena.alloc_child(0, valid[0], d1, 0.5);
+        let child2 = arena.alloc_child(0, valid[1], d2, 0.5);
         arena.get_mut(0).children = vec![child1, child2];
         arena.get_mut(0).visit_count = 10;
 
-        // Equal visits
         arena.get_mut(child1).visit_count = 1;
         arena.get_mut(child2).visit_count = 1;
 
-        // Mark child1's state as visited
-        let child1_game = state.clone_and_step([1, 2, 2]);
+        // Mark child1's data as visited
         let mut visited = HashSet::new();
-        visited.insert(child1_game.get_fast_hash());
+        visited.insert(d1);
 
-        // Child2 should be selected since child1 has penalty
-        let selected = select_child(&arena, 0, 1.4, &visited, 5);
+        let selected = select_child(&arena, 0, 1.4, &visited);
         assert_eq!(selected, child2);
     }
 
     #[test]
     fn test_no_visited_state_penalty_when_set_is_empty() {
-        // When penalize_visited_states is false, the agent passes an empty set,
-        // so no penalty should be applied even if a state would match.
-        let state = GameState::new(5, 0);
-        let mut arena = NodeArena::new(state.clone());
+        let mech = QGameMechanics::new(5, 0, 200);
+        let data = mech.create_initial_state();
+        let mut arena = NodeArena::new(data);
 
-        let child1 = arena.alloc_child(0, [1, 2, 2], 0.5);
-        let child2 = arena.alloc_child(0, [0, 1, 2], 0.5);
+        let mask = mech.get_action_mask_immut(data);
+        let valid: Vec<usize> = mask
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| if v { Some(i) } else { None })
+            .collect();
+        let mut d1 = data;
+        mech.apply_action_index(&mut d1, valid[0]);
+        let mut d2 = data;
+        mech.apply_action_index(&mut d2, valid[1]);
+        let child1 = arena.alloc_child(0, valid[0], d1, 0.5);
+        let child2 = arena.alloc_child(0, valid[1], d2, 0.5);
 
         arena.get_mut(0).children = vec![child1, child2];
         arena.get_mut(0).visit_count = 20;
 
-        // Give child1 higher Q-value and similar visits so it clearly wins
+        // Child1 higher Q with same visits
         arena.get_mut(child1).visit_count = 8;
         arena.get_mut(child1).value_sum = 6.0; // Q = 0.75
         arena.get_mut(child2).visit_count = 8;
@@ -631,24 +648,20 @@ mod tests {
 
         // Empty visited set (simulates penalize_visited_states=false)
         let visited = HashSet::new();
-
-        // Child1 should be selected (no penalty applied, higher Q)
-        let selected = select_child(&arena, 0, 1.4, &visited, 5);
+        let selected = select_child(&arena, 0, 1.4, &visited);
         assert_eq!(selected, child1);
 
-        // Now with visited_states containing child1's hash,
-        // child2 should be selected instead (penalty of -1.0 brings Q from 0.75 to -0.25)
-        let child1_game = state.clone_and_step([1, 2, 2]);
+        // Now with child1's data in the visited set, child2 wins
         let mut visited_with_penalty = HashSet::new();
-        visited_with_penalty.insert(child1_game.get_fast_hash());
-
-        let selected = select_child(&arena, 0, 1.4, &visited_with_penalty, 5);
+        visited_with_penalty.insert(d1);
+        let selected = select_child(&arena, 0, 1.4, &visited_with_penalty);
         assert_eq!(selected, child2);
     }
 
     #[test]
     fn test_mcts_search_basic() {
-        let state = GameState::new(5, 0); // No walls for faster search
+        let mech = QGameMechanics::new(5, 0, 200);
+        let data = mech.create_initial_state();
         let mut evaluator = MockEvaluator::new(0.0);
         let visited = HashSet::new();
 
@@ -659,22 +672,21 @@ mod tests {
             ..Default::default()
         };
 
-        let result = search(&config, state, &mut evaluator, &visited);
+        let result = search(&config, data, &mech, &mut evaluator, &visited);
         assert!(result.is_ok());
 
         let (children, _value) = result.unwrap();
 
-        // Should have some children
         assert!(!children.is_empty());
 
-        // Visit counts should be > 0
         let total_visits: u32 = children.iter().map(|c| c.visit_count).sum();
         assert!(total_visits > 0);
     }
 
     #[test]
     fn test_mcts_n_zero_uses_priors() {
-        let state = GameState::new(5, 3);
+        let mech = QGameMechanics::new(5, 3, 200);
+        let data = mech.create_initial_state();
         let mut evaluator = MockEvaluator::new(0.0);
         let visited = HashSet::new();
 
@@ -685,12 +697,11 @@ mod tests {
             ..Default::default()
         };
 
-        let result = search(&config, state, &mut evaluator, &visited);
+        let result = search(&config, data, &mech, &mut evaluator, &visited);
         assert!(result.is_ok());
 
         let (children, _) = result.unwrap();
 
-        // Visit counts should be proportional to priors (×1000)
         for child in &children {
             assert!(child.visit_count > 0);
         }
@@ -703,20 +714,36 @@ mod tests {
 
         apply_dirichlet_noise(&mut priors, 0.25, 0.5);
 
-        // Priors should have changed
         let changed = priors
             .iter()
             .zip(original.iter())
             .any(|(p, o)| (p - o).abs() > 1e-6);
         assert!(changed);
 
-        // Only non-zero priors should be affected
         assert!(priors[0] < 1e-6);
         assert!(priors[2] < 1e-6);
         assert!(priors[5] < 1e-6);
 
-        // Non-zero priors should sum to ~1
         let sum: f32 = priors.iter().sum();
         assert!((sum - 1.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_child_action_index_roundtrips_to_action() {
+        let bs = 5;
+        let mech = QGameMechanics::new(5, 3, 200);
+        let data = mech.create_initial_state();
+        let mut evaluator = MockEvaluator::new(0.0);
+        let visited = HashSet::new();
+        let config = MCTSConfig {
+            n: Some(2),
+            ucb_c: 1.4,
+            noise_epsilon: 0.0,
+            ..Default::default()
+        };
+        let (children, _) = search(&config, data, &mech, &mut evaluator, &visited).unwrap();
+        for c in &children {
+            assert_eq!(action_to_index(bs, &c.action), c.action_index);
+        }
     }
 }

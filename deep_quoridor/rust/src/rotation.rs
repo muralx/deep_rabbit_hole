@@ -10,6 +10,8 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::actions::{action_index_to_action, action_to_index, policy_size, ACTION_MOVE};
+use crate::compact::q_bit_repr::{WALL_HORIZONTAL, WALL_VERTICAL};
+use crate::compact::q_game_mechanics::QGameMechanics;
 use crate::game_state::GameState;
 
 /// Rotate a 2D grid 180° — equivalent to `np.rot90(grid, k=2)`.
@@ -115,6 +117,40 @@ pub fn remap_mask(mask: &[bool], mapping: &[usize]) -> Vec<bool> {
     out
 }
 
+/// Build a 180°-rotated u64 game state.
+///
+/// Mirrors `build_rotated_state` semantics for the compact representation:
+/// - Player positions flipped: `(r,c) -> (bs-1-r, bs-1-c)` for both players.
+/// - All wall positions flipped: `(r,c,o) -> (ws-1-r, ws-1-c, o)` where `ws = bs-1`.
+///   Orientation is preserved under 180° rotation.
+/// - Walls remaining, current player, completed steps: unchanged.
+pub fn rotate_compact_state(mechanics: &QGameMechanics, data: u64) -> u64 {
+    let repr = mechanics.repr();
+    let bs = repr.board_size();
+    let ws = bs - 1;
+    let mut out = repr.create_data();
+
+    for p in 0..2 {
+        let (r, c) = repr.get_player_position(data, p);
+        repr.set_player_position(&mut out, p, bs - 1 - r, bs - 1 - c);
+    }
+    for r in 0..ws {
+        for c in 0..ws {
+            for o in [WALL_VERTICAL, WALL_HORIZONTAL] {
+                if repr.get_wall(data, r, c, o) {
+                    repr.set_wall(&mut out, ws - 1 - r, ws - 1 - c, o, true);
+                }
+            }
+        }
+    }
+    repr.set_walls_remaining(&mut out, 0, repr.get_walls_remaining(data, 0));
+    repr.set_walls_remaining(&mut out, 1, repr.get_walls_remaining(data, 1));
+    repr.set_current_player(&mut out, repr.get_current_player(data));
+    repr.set_completed_steps(&mut out, repr.get_completed_steps(data));
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +251,24 @@ mod tests {
             let once = orig_to_rot[i];
             let twice = orig_to_rot[once];
             assert_eq!(twice, i, "double rotation not identity at i={i}");
+        }
+    }
+
+    #[test]
+    fn test_rotate_compact_state_matches_build_rotated_state_initial() {
+        // QBitRepr packs state into a u64; only smaller boards fit.
+        for bs in [3, 5] {
+            let state = GameState::new(bs, 3);
+            let rotated_state = build_rotated_state(&state);
+
+            let mech = QGameMechanics::new(bs as usize, 3, 200);
+            let data = mech.create_initial_state();
+            let rotated_data = rotate_compact_state(&mech, data);
+
+            // Compare via ResNet input tensors.
+            let a = crate::grid_helpers::grid_game_state_to_resnet_input(&rotated_state);
+            let b = crate::grid_helpers::compact_state_to_resnet_input(&mech, rotated_data);
+            assert_eq!(a, b, "rotation mismatch on initial state for bs={bs}");
         }
     }
 

@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use crate::compact::q_bit_repr::{WALL_HORIZONTAL, WALL_VERTICAL};
+use crate::compact::q_game_mechanics::QGameMechanics;
 use crate::game_state::GameState;
 use crate::grid::CELL_WALL;
 
@@ -63,12 +65,117 @@ pub fn grid_game_state_to_resnet_input(state: &GameState) -> ndarray::Array4<f32
     input
 }
 
+/// Convert a compact (u64) game state to 5-channel ResNet input format.
+///
+/// Produces a tensor bit-identical to `grid_game_state_to_resnet_input` for an
+/// equivalent `GameState`. Channels match: walls, current player pos, opponent
+/// pos, current player walls broadcast, opponent walls broadcast.
+pub fn compact_state_to_resnet_input(
+    mechanics: &QGameMechanics,
+    data: u64,
+) -> ndarray::Array4<f32> {
+    let repr = mechanics.repr();
+    let bs = repr.board_size();
+    let grid_size = bs * 2 + 3;
+    let current_player = repr.get_current_player(data);
+    let opponent = 1 - current_player;
+
+    let mut input = ndarray::Array4::<f32>::zeros((1, 5, grid_size, grid_size));
+
+    // Channel 0: border walls (rows/cols 0,1 and last two)
+    for i in 0..grid_size {
+        for j in 0..2 {
+            input[[0, 0, j, i]] = 1.0;
+            input[[0, 0, grid_size - 1 - j, i]] = 1.0;
+            input[[0, 0, i, j]] = 1.0;
+            input[[0, 0, i, grid_size - 1 - j]] = 1.0;
+        }
+    }
+    // Channel 0: placed walls. Mirrors set_wall_cells layout:
+    // Vertical at (r,c) → grid cells (r*2+2, c*2+3), (r*2+3, c*2+3), (r*2+4, c*2+3)
+    // Horizontal at (r,c) → grid cells (r*2+3, c*2+2), (r*2+3, c*2+3), (r*2+3, c*2+4)
+    for r in 0..bs - 1 {
+        for c in 0..bs - 1 {
+            if repr.get_wall(data, r, c, WALL_VERTICAL) {
+                let gc = c * 2 + 3;
+                for dr in 0..3 {
+                    input[[0, 0, r * 2 + 2 + dr, gc]] = 1.0;
+                }
+            }
+            if repr.get_wall(data, r, c, WALL_HORIZONTAL) {
+                let gr = r * 2 + 3;
+                for dc in 0..3 {
+                    input[[0, 0, gr, c * 2 + 2 + dc]] = 1.0;
+                }
+            }
+        }
+    }
+
+    // Channels 1/2: current/opponent position as 1-hot at (r*2+2, c*2+2).
+    let (cr, cc) = repr.get_player_position(data, current_player);
+    input[[0, 1, cr * 2 + 2, cc * 2 + 2]] = 1.0;
+    let (or_, oc) = repr.get_player_position(data, opponent);
+    input[[0, 2, or_ * 2 + 2, oc * 2 + 2]] = 1.0;
+
+    // Channels 3/4: walls remaining broadcast.
+    let my_w = repr.get_walls_remaining(data, current_player) as f32;
+    let opp_w = repr.get_walls_remaining(data, opponent) as f32;
+    input.slice_mut(ndarray::s![0, 3, .., ..]).fill(my_w);
+    input.slice_mut(ndarray::s![0, 4, .., ..]).fill(opp_w);
+
+    input
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actions::ACTION_MOVE;
     use crate::game_state::{create_initial_state, GameState};
     use crate::grid::{set_wall_cells, CELL_FREE, CELL_WALL};
     use ndarray::Array1;
+
+    #[test]
+    fn test_compact_resnet_matches_gamestate_resnet_initial() {
+        // QBitRepr packs state into a u64; only smaller boards fit.
+        for bs in [3, 5] {
+            let state = GameState::new(bs, 3);
+            let mech = QGameMechanics::new(bs as usize, 3, 200);
+            let data = mech.create_initial_state();
+            let a = grid_game_state_to_resnet_input(&state);
+            let b = compact_state_to_resnet_input(&mech, data);
+            assert_eq!(a, b, "initial state mismatch bs={bs}");
+        }
+    }
+
+    #[test]
+    fn test_compact_resnet_matches_after_stepping() {
+        // Run a small deterministic action sequence on both representations.
+        // No walls → only move actions, which are trivially valid.
+        let bs = 5;
+        let mut state = GameState::new(bs, 0);
+        let mech = QGameMechanics::new(bs as usize, 0, 200);
+        let mut data = mech.create_initial_state();
+
+        let actions: Vec<[i32; 3]> = vec![
+            [1, 2, ACTION_MOVE],
+            [3, 2, ACTION_MOVE],
+            [1, 1, ACTION_MOVE],
+            [3, 1, ACTION_MOVE],
+        ];
+
+        let a0 = grid_game_state_to_resnet_input(&state);
+        let b0 = compact_state_to_resnet_input(&mech, data);
+        assert_eq!(a0, b0, "step 0");
+
+        for (i, action) in actions.iter().enumerate() {
+            state.step(*action);
+            let action_idx = crate::actions::action_to_index(bs, action);
+            mech.apply_action_index(&mut data, action_idx);
+            let a = grid_game_state_to_resnet_input(&state);
+            let b = compact_state_to_resnet_input(&mech, data);
+            assert_eq!(a, b, "step {}", i + 1);
+        }
+    }
 
     #[test]
     fn test_resnet_input_shape() {

@@ -588,6 +588,76 @@ impl QGameMechanics {
     pub fn display(&self, data: u64) -> String {
         self.repr.display(data)
     }
+
+    /// Compute the full action mask for the current player.
+    ///
+    /// `data` is modified during the call (wall validation places-then-removes
+    /// walls in place) but restored before return; observers see no change.
+    pub fn get_action_mask(&self, data: &mut u64) -> Vec<bool> {
+        let bs = self.repr.board_size();
+        let board_size_i = bs as i32;
+        let total = crate::actions::policy_size(board_size_i);
+        let mut mask = vec![false; total];
+
+        let num_moves = bs * bs;
+        for (r, c) in self.get_valid_moves(*data) {
+            mask[r * bs + c] = true;
+        }
+
+        let ws = bs - 1;
+        let num_walls = ws * ws;
+        for (r, c, orientation) in self.get_valid_wall_placements(data) {
+            let wall_off = num_moves + orientation * num_walls + r * ws + c;
+            mask[wall_off] = true;
+        }
+        mask
+    }
+
+    /// Immutable wrapper around `get_action_mask` for callers that hold `u64` by value.
+    pub fn get_action_mask_immut(&self, data: u64) -> Vec<bool> {
+        let mut d = data;
+        self.get_action_mask(&mut d)
+    }
+
+    /// Apply a flat policy action index to `data`, mirroring `GameState::step`.
+    ///
+    /// Decodes the action, executes the appropriate move/wall placement, then
+    /// switches to the next player (which also increments `completed_steps`).
+    pub fn apply_action_index(&self, data: &mut u64, action_idx: usize) {
+        let bs = self.repr.board_size() as i32;
+        let action = crate::actions::action_index_to_action(bs, action_idx);
+        let (r, c, t) = (action[0] as usize, action[1] as usize, action[2]);
+        let player = self.repr.get_current_player(*data);
+        match t {
+            crate::actions::ACTION_MOVE => {
+                self.execute_move(data, player, r, c);
+            }
+            crate::actions::ACTION_WALL_VERTICAL => {
+                self.execute_wall_placement(data, player, r, c, WALL_VERTICAL);
+            }
+            crate::actions::ACTION_WALL_HORIZONTAL => {
+                self.execute_wall_placement(data, player, r, c, WALL_HORIZONTAL);
+            }
+            _ => panic!("Invalid action type: {}", t),
+        }
+        self.switch_player(data);
+    }
+
+    /// Returns true if either player has reached their goal row.
+    pub fn is_game_over(&self, data: u64) -> bool {
+        self.check_win(data, 0) || self.check_win(data, 1)
+    }
+
+    /// Returns `Some(player)` if a player has won, `None` otherwise.
+    pub fn winner(&self, data: u64) -> Option<usize> {
+        if self.check_win(data, 0) {
+            Some(0)
+        } else if self.check_win(data, 1) {
+            Some(1)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]

@@ -6,15 +6,20 @@ use anyhow::{Context, Result};
 use ort::session::Session;
 
 use crate::agents::onnx_agent::softmax;
-use crate::game_state::GameState;
-use crate::grid_helpers::grid_game_state_to_resnet_input;
-use crate::rotation::{build_rotated_state, create_rotation_mapping, remap_policy};
+use crate::compact::q_game_mechanics::QGameMechanics;
+use crate::grid_helpers::compact_state_to_resnet_input;
+use crate::rotation::{create_rotation_mapping, remap_policy, rotate_compact_state};
 
 /// Trait for evaluating game positions.
 ///
 /// Returns `(value_for_current_player, masked_softmax_priors)`.
 pub trait Evaluator {
-    fn evaluate(&mut self, state: &GameState, action_mask: &[bool]) -> Result<(f32, Vec<f32>)>;
+    fn evaluate(
+        &mut self,
+        data: u64,
+        mechanics: &QGameMechanics,
+        action_mask: &[bool],
+    ) -> Result<(f32, Vec<f32>)>;
 }
 
 /// ONNX-based evaluator for MCTS.
@@ -46,26 +51,39 @@ impl OnnxEvaluator {
 }
 
 impl Evaluator for OnnxEvaluator {
-    fn evaluate(&mut self, state: &GameState, action_mask: &[bool]) -> Result<(f32, Vec<f32>)> {
+    fn evaluate(
+        &mut self,
+        data: u64,
+        mechanics: &QGameMechanics,
+        action_mask: &[bool],
+    ) -> Result<(f32, Vec<f32>)> {
+        let bs = mechanics.repr().board_size() as i32;
+        let current_player = mechanics.repr().get_current_player(data);
+
         let rotated_to_original = self
             .rotated_to_original_by_board_size
-            .entry(state.board_size)
-            .or_insert_with(|| create_rotation_mapping(state.board_size).1);
-        let (work_state, work_action_mask, rotated_to_original) = if state.current_player == 1 {
-            let rotated_state = build_rotated_state(state);
-            let mask = rotated_state.get_action_mask();
-            (rotated_state, mask, Some(rotated_to_original.as_slice()))
+            .entry(bs)
+            .or_insert_with(|| create_rotation_mapping(bs).1);
+
+        let (work_data, work_action_mask, rotated_to_original) = if current_player == 1 {
+            let rotated_data = rotate_compact_state(mechanics, data);
+            let rotated_mask = mechanics.get_action_mask_immut(rotated_data);
+            (
+                rotated_data,
+                rotated_mask,
+                Some(rotated_to_original.as_slice()),
+            )
         } else {
-            (state.clone(), action_mask.to_vec(), None)
+            (data, action_mask.to_vec(), None)
         };
 
         // Build ResNet input tensor
-        let resnet_input = grid_game_state_to_resnet_input(&work_state);
+        let resnet_input = compact_state_to_resnet_input(mechanics, work_data);
 
         // Convert to flat vec for ORT
         let shape = resnet_input.shape().to_vec();
-        let data: Vec<f32> = resnet_input.iter().copied().collect();
-        let input_value = ort::value::Value::from_array((shape.as_slice(), data))
+        let input_data: Vec<f32> = resnet_input.iter().copied().collect();
+        let input_value = ort::value::Value::from_array((shape.as_slice(), input_data))
             .context("Failed to create ONNX input value")?;
 
         // Run inference
@@ -98,7 +116,12 @@ impl Evaluator for OnnxEvaluator {
 }
 
 impl Evaluator for UniformMockEvaluator {
-    fn evaluate(&mut self, _state: &GameState, action_mask: &[bool]) -> Result<(f32, Vec<f32>)> {
+    fn evaluate(
+        &mut self,
+        _data: u64,
+        _mechanics: &QGameMechanics,
+        action_mask: &[bool],
+    ) -> Result<(f32, Vec<f32>)> {
         let valid_count = action_mask.iter().filter(|&&valid| valid).count();
         let mut priors = vec![0.0f32; action_mask.len()];
         if valid_count > 0 {

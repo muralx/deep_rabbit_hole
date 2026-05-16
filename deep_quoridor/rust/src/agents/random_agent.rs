@@ -3,7 +3,7 @@
 use rand::Rng;
 
 use crate::agents::ActionSelector;
-use crate::game_state::GameState;
+use crate::compact::q_game_mechanics::QGameMechanics;
 
 /// An agent that selects a random valid action.
 pub struct RandomAgent {
@@ -27,7 +27,8 @@ impl Default for RandomAgent {
 impl ActionSelector for RandomAgent {
     fn select_action(
         &mut self,
-        _state: &GameState,
+        _data: u64,
+        _mechanics: &QGameMechanics,
         action_mask: &[bool],
     ) -> anyhow::Result<(usize, Vec<f32>)> {
         // Collect valid action indices
@@ -57,14 +58,20 @@ impl ActionSelector for RandomAgent {
 mod tests {
     use super::*;
 
+    fn make_mech() -> (QGameMechanics, u64) {
+        let mech = QGameMechanics::new(5, 3, 200);
+        let data = mech.create_initial_state();
+        (mech, data)
+    }
+
     #[test]
     fn test_random_agent_picks_valid_action() {
         let mut agent = RandomAgent::new();
-        let state = GameState::new(5, 3);
+        let (mech, data) = make_mech();
         let mask = vec![false, false, true, false, true, true];
 
         for _ in 0..50 {
-            let (idx, _) = agent.select_action(&state, &mask).unwrap();
+            let (idx, _) = agent.select_action(data, &mech, &mask).unwrap();
             assert!(
                 mask[idx],
                 "RandomAgent picked an invalid action index {}",
@@ -76,10 +83,10 @@ mod tests {
     #[test]
     fn test_random_agent_policy_sums_to_one() {
         let mut agent = RandomAgent::new();
-        let state = GameState::new(5, 3);
+        let (mech, data) = make_mech();
         let mask = vec![false, true, true, false, true];
 
-        let (_, policy) = agent.select_action(&state, &mask).unwrap();
+        let (_, policy) = agent.select_action(data, &mech, &mask).unwrap();
 
         let sum: f32 = policy.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6);
@@ -91,10 +98,10 @@ mod tests {
     #[test]
     fn test_random_agent_no_valid_actions_fails() {
         let mut agent = RandomAgent::new();
-        let state = GameState::new(5, 3);
+        let (mech, data) = make_mech();
         let mask = vec![false, false, false];
 
-        let result = agent.select_action(&state, &mask);
+        let result = agent.select_action(data, &mech, &mask);
         assert!(result.is_err());
     }
 }

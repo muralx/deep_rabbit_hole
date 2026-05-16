@@ -515,9 +515,24 @@ fn generate_rust_mcts_trace(
 
         // Run MCTS on the original (unrotated) state, matching Python's behaviour where
         // the evaluator handles rotation internally and MCTS always operates in the
-        // original action-index space for both players.
+        // original action-index space for both players. Convert the GameState to the
+        // compact (u64, mechanics) form that MCTS now uses.
+        let mechanics = crate::compact::q_game_mechanics::QGameMechanics::new(
+            board_size as usize,
+            max_walls as usize,
+            max_steps as usize,
+        );
+        let mut data = mechanics.repr().create_data();
+        mechanics.repr().from_game_state(
+            &mut data,
+            &state.grid(),
+            &state.player_positions(),
+            &state.walls_remaining(),
+            state.current_player,
+            state.completed_steps as i32,
+        );
         let (children, root_value): (Vec<ChildInfo>, f32) =
-            search(&config, state.clone(), &mut evaluator, &visited_states)
+            search(&config, data, &mechanics, &mut evaluator, &visited_states)
                 .expect("MCTS search should succeed");
 
         let visit_counts: Vec<u32> = children.iter().map(|c| c.visit_count).collect();
