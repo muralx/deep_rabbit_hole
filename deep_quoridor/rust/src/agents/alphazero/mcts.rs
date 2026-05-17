@@ -402,7 +402,9 @@ pub fn search<E: Evaluator>(
         .iter()
         .map(|&child_idx| {
             let child = arena.get(child_idx);
-            let ai = child.action_index.expect("child node must have action_index");
+            let ai = child
+                .action_index
+                .expect("child node must have action_index");
             let action = action_index_to_action(bs, ai);
             ChildInfo {
                 action,

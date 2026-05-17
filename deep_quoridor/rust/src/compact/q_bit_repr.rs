@@ -182,7 +182,8 @@ impl QBitRepr {
     ) {
         debug_assert!(bit_offset + num_bits <= self.total_scalar_bits);
         let mask = (1u64 << num_bits) - 1;
-        state.scalars = (state.scalars & !(mask << bit_offset)) | ((value as u64 & mask) << bit_offset);
+        state.scalars =
+            (state.scalars & !(mask << bit_offset)) | ((value as u64 & mask) << bit_offset);
     }
 
     /// Read a single scalar bit.
@@ -204,7 +205,13 @@ impl QBitRepr {
     }
 
     /// Check if a wall is present at the given position
-    pub fn get_wall(&self, state: CompactState, row: usize, col: usize, orientation: usize) -> bool {
+    pub fn get_wall(
+        &self,
+        state: CompactState,
+        row: usize,
+        col: usize,
+        orientation: usize,
+    ) -> bool {
         let wall_index = self.wall_position_to_index(row, col, orientation);
         self.get_wall_bit(state, wall_index)
     }
@@ -225,7 +232,8 @@ impl QBitRepr {
     /// Get a player's position
     pub fn get_player_position(&self, state: CompactState, player: usize) -> (usize, usize) {
         debug_assert!(player < 2);
-        let index = self.get_scalar_bits(state, self.player_pos_offsets[player], self.position_bits);
+        let index =
+            self.get_scalar_bits(state, self.player_pos_offsets[player], self.position_bits);
         self.index_to_position(index)
     }
 
@@ -287,7 +295,11 @@ impl QBitRepr {
 
     /// Get the number of completed steps
     pub fn get_completed_steps(&self, state: CompactState) -> usize {
-        self.get_scalar_bits(state, self.completed_steps_offset, self.completed_steps_bits)
+        self.get_scalar_bits(
+            state,
+            self.completed_steps_offset,
+            self.completed_steps_bits,
+        )
     }
 
     /// Set the number of completed steps
@@ -426,7 +438,8 @@ impl QBitRepr {
                 let mut wall_line = String::new();
                 for col in 0..self.board_size {
                     // Print horizontal wall below this cell
-                    if col < self.board_size - 1 && self.get_wall(state, row, col, WALL_HORIZONTAL) {
+                    if col < self.board_size - 1 && self.get_wall(state, row, col, WALL_HORIZONTAL)
+                    {
                         wall_line.push('-');
                     } else if col > 0 && self.get_wall(state, row, col - 1, WALL_HORIZONTAL) {
                         wall_line.push('-');

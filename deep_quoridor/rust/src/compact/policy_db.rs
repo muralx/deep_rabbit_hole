@@ -114,7 +114,11 @@ fn parse_meta(kv: Option<&Vec<KeyValue>>, key: &str) -> Option<usize> {
 
 fn bytes_to_state(b: &[u8]) -> Result<CompactState, Box<dyn std::error::Error>> {
     if b.len() != STATE_BYTES {
-        return Err(format!("state column row width is {}, expected {STATE_BYTES}", b.len()).into());
+        return Err(format!(
+            "state column row width is {}, expected {STATE_BYTES}",
+            b.len()
+        )
+        .into());
     }
     let mut a = [0u8; STATE_BYTES];
     a.copy_from_slice(b);
@@ -168,16 +172,8 @@ impl PolicyDb {
                 .ok_or_else(|| format!("row group {i} missing statistics on state column"))?;
             let (min, max) = match stats {
                 Statistics::FixedLenByteArray(s) => (
-                    slice_to_arr(
-                        s.min_opt()
-                            .ok_or("missing min stat on state")?
-                            .as_ref(),
-                    )?,
-                    slice_to_arr(
-                        s.max_opt()
-                            .ok_or("missing max stat on state")?
-                            .as_ref(),
-                    )?,
+                    slice_to_arr(s.min_opt().ok_or("missing min stat on state")?.as_ref())?,
+                    slice_to_arr(s.max_opt().ok_or("missing max stat on state")?.as_ref())?,
                 ),
                 _ => {
                     return Err(
@@ -647,10 +643,7 @@ fn append_batch(
 }
 
 /// Get all valid actions (moves + wall placements) for the current player.
-fn get_all_actions(
-    mechanics: &QGameMechanics,
-    data: &mut CompactState,
-) -> Vec<(u8, u8, u8)> {
+fn get_all_actions(mechanics: &QGameMechanics, data: &mut CompactState) -> Vec<(u8, u8, u8)> {
     let moves = mechanics.get_valid_moves(*data);
     let mut actions: Vec<(u8, u8, u8)> = moves
         .into_iter()

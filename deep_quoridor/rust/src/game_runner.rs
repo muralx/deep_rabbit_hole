@@ -103,11 +103,8 @@ pub fn play_game(
     trace: bool,
     mut observer: Option<&mut dyn PlayGameObserver>,
 ) -> anyhow::Result<GameResult> {
-    let mechanics = QGameMechanics::new(
-        board_size as usize,
-        max_walls as usize,
-        max_steps as usize,
-    );
+    let mechanics =
+        QGameMechanics::new(board_size as usize, max_walls as usize, max_steps as usize);
     let mut data = mechanics.create_initial_state();
     let (original_to_rotated, _) = create_rotation_mapping(board_size);
 

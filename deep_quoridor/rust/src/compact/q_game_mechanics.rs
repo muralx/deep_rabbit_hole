@@ -348,7 +348,13 @@ impl QGameMechanics {
     }
 
     /// Execute a move action
-    pub fn execute_move(&self, data: &mut CompactState, player: usize, dest_row: usize, dest_col: usize) {
+    pub fn execute_move(
+        &self,
+        data: &mut CompactState,
+        player: usize,
+        dest_row: usize,
+        dest_col: usize,
+    ) {
         self.repr
             .set_player_position(data, player, dest_row, dest_col);
     }
