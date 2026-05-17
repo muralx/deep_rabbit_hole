@@ -9,6 +9,7 @@ use rand_distr::{Dirichlet, Distribution};
 use crate::actions::action_index_to_action;
 #[cfg(test)]
 use crate::actions::action_to_index;
+use crate::compact::q_bit_repr::CompactState;
 use crate::compact::q_game_mechanics::QGameMechanics;
 
 use super::evaluator::Evaluator;
@@ -61,7 +62,7 @@ pub struct ChildInfo {
 #[derive(Debug)]
 pub struct Node {
     /// The compact game state at this node.
-    pub data: u64,
+    pub data: CompactState,
     /// Parent node index in the arena, None for root.
     pub parent: Option<usize>,
     /// Flat policy index for the action taken from parent to reach this node.
@@ -82,7 +83,7 @@ pub struct Node {
 
 impl Node {
     /// Create a new root node.
-    pub fn new_root(data: u64) -> Self {
+    pub fn new_root(data: CompactState) -> Self {
         Self {
             data,
             parent: None,
@@ -97,7 +98,7 @@ impl Node {
     }
 
     /// Create a new child node with its (already computed) state.
-    pub fn new_child(parent: usize, action_index: usize, data: u64, prior: f32) -> Self {
+    pub fn new_child(parent: usize, action_index: usize, data: CompactState, prior: f32) -> Self {
         Self {
             data,
             parent: Some(parent),
@@ -133,7 +134,7 @@ pub struct NodeArena {
 
 impl NodeArena {
     /// Create a new arena with a root node.
-    pub fn new(root_data: u64) -> Self {
+    pub fn new(root_data: CompactState) -> Self {
         let root = Node::new_root(root_data);
         Self { nodes: vec![root] }
     }
@@ -143,7 +144,7 @@ impl NodeArena {
         &mut self,
         parent: usize,
         action_index: usize,
-        data: u64,
+        data: CompactState,
         prior: f32,
     ) -> usize {
         let idx = self.nodes.len();
@@ -196,7 +197,7 @@ pub fn select_child(
     arena: &NodeArena,
     node_idx: usize,
     ucb_c: f32,
-    visited_states: &HashSet<u64>,
+    visited_states: &HashSet<CompactState>,
 ) -> usize {
     let node = arena.get(node_idx);
     let parent_visits = node.visit_count.max(1) as f32;
@@ -294,10 +295,10 @@ pub fn apply_dirichlet_noise(priors: &mut [f32], epsilon: f32, alpha: f32) {
 /// Run MCTS search and return child information.
 pub fn search<E: Evaluator>(
     config: &MCTSConfig,
-    root_data: u64,
+    root_data: CompactState,
     mechanics: &QGameMechanics,
     evaluator: &mut E,
-    visited_states: &HashSet<u64>,
+    visited_states: &HashSet<CompactState>,
 ) -> anyhow::Result<(Vec<ChildInfo>, f32)> {
     let bs = mechanics.repr().board_size() as i32;
     let mut arena = NodeArena::new(root_data);
@@ -433,7 +434,7 @@ mod tests {
     impl Evaluator for MockEvaluator {
         fn evaluate(
             &mut self,
-            _data: u64,
+            _data: CompactState,
             _mechanics: &QGameMechanics,
             action_mask: &[bool],
         ) -> Result<(f32, Vec<f32>)> {
@@ -452,7 +453,7 @@ mod tests {
         }
     }
 
-    fn make_mech_state() -> (QGameMechanics, u64) {
+    fn make_mech_state() -> (QGameMechanics, CompactState) {
         let mech = QGameMechanics::new(5, 3, 200);
         let data = mech.create_initial_state();
         (mech, data)

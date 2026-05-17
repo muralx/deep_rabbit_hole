@@ -4,7 +4,7 @@ use rand::seq::SliceRandom;
 use rayon::prelude::*;
 use std::sync::Arc;
 
-use super::q_bit_repr::{WALL_HORIZONTAL, WALL_VERTICAL};
+use super::q_bit_repr::{CompactState, WALL_HORIZONTAL, WALL_VERTICAL};
 use super::q_game_mechanics::{BfsBuffer, QGameMechanics};
 
 pub const WINNING_REWARD: f32 = 1e6;
@@ -21,7 +21,7 @@ pub struct TranspositionEntry {
 }
 
 /// Compute distance to goal for a player using QBitRepr state
-fn distance_to_goal(mechanics: &QGameMechanics, data: u64, player: usize) -> i32 {
+fn distance_to_goal(mechanics: &QGameMechanics, data: CompactState, player: usize) -> i32 {
     let (row, col) = mechanics.repr().get_player_position(data, player);
     let board_size = mechanics.repr().board_size();
     let goal_row = mechanics.get_goal_row(player);
@@ -96,7 +96,7 @@ fn distance_to_goal(mechanics: &QGameMechanics, data: u64, player: usize) -> i32
 /// Compute heuristic for QBitRepr state
 fn compute_heuristic(
     mechanics: &QGameMechanics,
-    data: u64,
+    data: CompactState,
     agent_player: usize,
     heuristic: i32,
 ) -> f32 {
@@ -130,7 +130,7 @@ fn compute_heuristic(
 /// rather than validating all possible wall placements upfront.
 fn sample_actions(
     mechanics: &QGameMechanics,
-    data: &mut u64,
+    data: &mut CompactState,
     branching_factor: usize,
 ) -> Vec<(usize, usize, usize)> {
     let mut rng = rand::thread_rng();
@@ -184,7 +184,7 @@ fn sample_actions(
 #[allow(clippy::too_many_arguments)]
 fn minimax(
     mechanics: &QGameMechanics,
-    data: &mut u64,
+    data: &mut CompactState,
     current_player: usize,
     agent_player: usize,
     search_depth: usize,
@@ -194,7 +194,7 @@ fn minimax(
     heuristic: i32,
     mut alpha: f32,
     mut beta: f32,
-    transposition_table: Arc<DashMap<u64, TranspositionEntry>>,
+    transposition_table: Arc<DashMap<CompactState, TranspositionEntry>>,
 ) -> f32 {
     // Check transposition table for cached result
     if let Some(entry) = transposition_table.get(data) {
@@ -312,7 +312,7 @@ fn minimax(
 /// Evaluate actions using QBitRepr-based minimax (parallelized)
 pub fn evaluate_actions(
     mechanics: &QGameMechanics,
-    data: u64,
+    data: CompactState,
     max_search_depth: usize,
     branching_factor: usize,
     discount_factor: f32,
@@ -320,7 +320,7 @@ pub fn evaluate_actions(
 ) -> (
     Vec<(usize, usize, usize)>,
     Vec<f32>,
-    DashMap<u64, TranspositionEntry>,
+    DashMap<CompactState, TranspositionEntry>,
 ) {
     let current_player = mechanics.repr().get_current_player(data);
     let agent_player = current_player;

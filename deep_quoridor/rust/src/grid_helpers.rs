@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::compact::q_bit_repr::{WALL_HORIZONTAL, WALL_VERTICAL};
+use crate::compact::q_bit_repr::{CompactState, WALL_HORIZONTAL, WALL_VERTICAL};
 use crate::compact::q_game_mechanics::QGameMechanics;
 use crate::game_state::GameState;
 use crate::grid::CELL_WALL;
@@ -65,14 +65,14 @@ pub fn grid_game_state_to_resnet_input(state: &GameState) -> ndarray::Array4<f32
     input
 }
 
-/// Convert a compact (u64) game state to 5-channel ResNet input format.
+/// Convert a compact game state to 5-channel ResNet input format.
 ///
 /// Produces a tensor bit-identical to `grid_game_state_to_resnet_input` for an
 /// equivalent `GameState`. Channels match: walls, current player pos, opponent
 /// pos, current player walls broadcast, opponent walls broadcast.
 pub fn compact_state_to_resnet_input(
     mechanics: &QGameMechanics,
-    data: u64,
+    data: CompactState,
 ) -> ndarray::Array4<f32> {
     let repr = mechanics.repr();
     let bs = repr.board_size();
@@ -136,8 +136,7 @@ mod tests {
 
     #[test]
     fn test_compact_resnet_matches_gamestate_resnet_initial() {
-        // QBitRepr packs state into a u64; only smaller boards fit.
-        for bs in [3, 5] {
+        for bs in [3, 5, 9] {
             let state = GameState::new(bs, 3);
             let mech = QGameMechanics::new(bs as usize, 3, 200);
             let data = mech.create_initial_state();

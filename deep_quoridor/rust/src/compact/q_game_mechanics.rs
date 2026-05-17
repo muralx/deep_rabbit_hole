@@ -4,7 +4,7 @@
 /// the bit-packed representation instead of converting to/from grid arrays.
 use std::collections::VecDeque;
 
-use super::q_bit_repr::{QBitRepr, WALL_HORIZONTAL, WALL_VERTICAL};
+use super::q_bit_repr::{CompactState, QBitRepr, WALL_HORIZONTAL, WALL_VERTICAL};
 
 /// Reusable buffer for BFS operations, avoiding repeated heap allocations.
 pub struct BfsBuffer {
@@ -61,7 +61,7 @@ impl QGameMechanics {
 
     /// Create initial game state
     #[allow(dead_code)]
-    pub fn create_initial_state(&self) -> u64 {
+    pub fn create_initial_state(&self) -> CompactState {
         let mut data = self.repr.create_data();
         let board_size = self.repr.board_size();
 
@@ -90,7 +90,7 @@ impl QGameMechanics {
     /// Doesn't check that players can reach their goal still.
     pub fn is_wall_placement_free(
         &self,
-        data: u64,
+        data: CompactState,
         row: usize,
         col: usize,
         orientation: usize,
@@ -149,21 +149,21 @@ impl QGameMechanics {
 
     /// Place a wall (no validation - use is_wall_placement_valid first)
     #[inline]
-    pub fn place_wall(&self, data: &mut u64, row: usize, col: usize, orientation: usize) {
+    pub fn place_wall(&self, data: &mut CompactState, row: usize, col: usize, orientation: usize) {
         self.repr.set_wall(data, row, col, orientation, true);
     }
 
     /// Remove a wall
     #[inline]
     #[allow(dead_code)]
-    pub fn remove_wall(&self, data: &mut u64, row: usize, col: usize, orientation: usize) {
+    pub fn remove_wall(&self, data: &mut CompactState, row: usize, col: usize, orientation: usize) {
         self.repr.set_wall(data, row, col, orientation, false);
     }
 
     /// Check if there's a wall blocking movement between two adjacent cells
     fn is_wall_between(
         &self,
-        data: u64,
+        data: CompactState,
         from_row: usize,
         from_col: usize,
         to_row: usize,
@@ -264,7 +264,7 @@ impl QGameMechanics {
 
     /// Check if a player can reach their goal row using BFS.
     /// Uses a reusable BfsBuffer to avoid allocations.
-    fn can_reach_goal(&self, data: u64, player: usize, buf: &mut BfsBuffer) -> bool {
+    fn can_reach_goal(&self, data: CompactState, player: usize, buf: &mut BfsBuffer) -> bool {
         let board_size = self.repr.board_size();
         let goal_row = self.goal_rows[player];
 
@@ -328,7 +328,7 @@ impl QGameMechanics {
     /// Temporarily mutates `data` in-place (places then removes the wall) to avoid cloning.
     pub fn is_wall_placement_valid(
         &self,
-        data: &mut u64,
+        data: &mut CompactState,
         row: usize,
         col: usize,
         orientation: usize,
@@ -348,7 +348,7 @@ impl QGameMechanics {
     }
 
     /// Execute a move action
-    pub fn execute_move(&self, data: &mut u64, player: usize, dest_row: usize, dest_col: usize) {
+    pub fn execute_move(&self, data: &mut CompactState, player: usize, dest_row: usize, dest_col: usize) {
         self.repr
             .set_player_position(data, player, dest_row, dest_col);
     }
@@ -356,7 +356,7 @@ impl QGameMechanics {
     /// Execute a wall placement action
     pub fn execute_wall_placement(
         &self,
-        data: &mut u64,
+        data: &mut CompactState,
         player: usize,
         row: usize,
         col: usize,
@@ -372,7 +372,7 @@ impl QGameMechanics {
     }
 
     /// Switch to the next player
-    pub fn switch_player(&self, data: &mut u64) {
+    pub fn switch_player(&self, data: &mut CompactState) {
         let current = self.repr.get_current_player(*data);
         self.repr.set_current_player(data, 1 - current);
 
@@ -382,19 +382,19 @@ impl QGameMechanics {
     }
 
     /// Check if a player has won
-    pub fn check_win(&self, data: u64, player: usize) -> bool {
+    pub fn check_win(&self, data: CompactState, player: usize) -> bool {
         let (row, _col) = self.repr.get_player_position(data, player);
         row == self.goal_rows[player]
     }
 
     /// Check if the game is a draw (max steps reached)
     #[allow(dead_code)]
-    pub fn is_draw(&self, data: u64) -> bool {
+    pub fn is_draw(&self, data: CompactState) -> bool {
         self.repr.get_completed_steps(data) >= self.repr.max_steps()
     }
 
     /// Get all valid wall placements for the current player
-    pub fn get_valid_wall_placements(&self, data: &mut u64) -> Vec<(usize, usize, usize)> {
+    pub fn get_valid_wall_placements(&self, data: &mut CompactState) -> Vec<(usize, usize, usize)> {
         let current_player = self.repr.get_current_player(*data);
 
         // Check if player has walls remaining
@@ -422,7 +422,7 @@ impl QGameMechanics {
     }
 
     /// Get all valid moves for the current player
-    pub fn get_valid_moves(&self, data: u64) -> Vec<(usize, usize)> {
+    pub fn get_valid_moves(&self, data: CompactState) -> Vec<(usize, usize)> {
         let current_player = self.repr.get_current_player(data);
         let board_size = self.repr.board_size();
 
@@ -581,11 +581,11 @@ impl QGameMechanics {
     }
 
     /// Display the board state as text art
-    pub fn print(&self, data: u64) {
+    pub fn print(&self, data: CompactState) {
         println!("{}", self.display(data));
     }
 
-    pub fn display(&self, data: u64) -> String {
+    pub fn display(&self, data: CompactState) -> String {
         self.repr.display(data)
     }
 
@@ -593,7 +593,7 @@ impl QGameMechanics {
     ///
     /// `data` is modified during the call (wall validation places-then-removes
     /// walls in place) but restored before return; observers see no change.
-    pub fn get_action_mask(&self, data: &mut u64) -> Vec<bool> {
+    pub fn get_action_mask(&self, data: &mut CompactState) -> Vec<bool> {
         let bs = self.repr.board_size();
         let board_size_i = bs as i32;
         let total = crate::actions::policy_size(board_size_i);
@@ -613,8 +613,8 @@ impl QGameMechanics {
         mask
     }
 
-    /// Immutable wrapper around `get_action_mask` for callers that hold `u64` by value.
-    pub fn get_action_mask_immut(&self, data: u64) -> Vec<bool> {
+    /// Immutable wrapper around `get_action_mask` for callers that hold the state by value.
+    pub fn get_action_mask_immut(&self, data: CompactState) -> Vec<bool> {
         let mut d = data;
         self.get_action_mask(&mut d)
     }
@@ -623,7 +623,7 @@ impl QGameMechanics {
     ///
     /// Decodes the action, executes the appropriate move/wall placement, then
     /// switches to the next player (which also increments `completed_steps`).
-    pub fn apply_action_index(&self, data: &mut u64, action_idx: usize) {
+    pub fn apply_action_index(&self, data: &mut CompactState, action_idx: usize) {
         let bs = self.repr.board_size() as i32;
         let action = crate::actions::action_index_to_action(bs, action_idx);
         let (r, c, t) = (action[0] as usize, action[1] as usize, action[2]);
@@ -644,12 +644,12 @@ impl QGameMechanics {
     }
 
     /// Returns true if either player has reached their goal row.
-    pub fn is_game_over(&self, data: u64) -> bool {
+    pub fn is_game_over(&self, data: CompactState) -> bool {
         self.check_win(data, 0) || self.check_win(data, 1)
     }
 
     /// Returns `Some(player)` if a player has won, `None` otherwise.
-    pub fn winner(&self, data: u64) -> Option<usize> {
+    pub fn winner(&self, data: CompactState) -> Option<usize> {
         if self.check_win(data, 0) {
             Some(0)
         } else if self.check_win(data, 1) {
@@ -838,7 +838,7 @@ mod tests {
         board_str: &str,
     ) -> (
         QGameMechanics,
-        u64,
+        CompactState,
         Vec<(usize, usize)>,
         Vec<(usize, usize, usize)>,
     ) {

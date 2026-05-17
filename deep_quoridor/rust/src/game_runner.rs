@@ -11,6 +11,7 @@ use crate::actions::{
     action_index_to_action, ACTION_MOVE, ACTION_WALL_HORIZONTAL, ACTION_WALL_VERTICAL,
 };
 use crate::agents::ActionSelector;
+use crate::compact::q_bit_repr::CompactState;
 use crate::compact::q_game_mechanics::QGameMechanics;
 use crate::game_state::GameState;
 use crate::grid_helpers::compact_state_to_resnet_input;
@@ -38,7 +39,7 @@ fn format_action(_board_size: i32, row: i32, col: i32, action_type: i32) -> Stri
     }
 }
 
-/// Build a transient `GameState` from a compact `u64` state.
+/// Build a transient `GameState` from a compact state.
 ///
 /// Used only to feed `PlayGameObserver::on_state_snapshot`, which keeps its
 /// `&GameState` signature so the cross-language trace observer in
@@ -47,7 +48,7 @@ fn format_action(_board_size: i32, row: i32, col: i32, action_type: i32) -> Stri
 /// observer.
 fn compact_to_game_state(
     mechanics: &QGameMechanics,
-    data: u64,
+    data: CompactState,
     board_size: i32,
     max_walls: i32,
 ) -> GameState {
@@ -85,7 +86,7 @@ pub struct GameResult {
     pub replay_items: Vec<ReplayBufferItem>,
 }
 
-/// Play a complete game between two agents using the compact `u64` state.
+/// Play a complete game between two agents using the compact state.
 ///
 /// `agent_p1` controls player 0 and `agent_p2` controls player 1.
 /// Player 0 moves first. Action selection runs in original orientation; any
@@ -177,7 +178,7 @@ pub fn play_game(
             player: current_player,
         });
 
-        // Apply action on the canonical u64 state
+        // Apply action on the canonical compact state
         mechanics.apply_action_index(&mut data, action_idx);
 
         if trace {
@@ -244,7 +245,7 @@ mod tests {
     impl ActionSelector for FirstValidAgent {
         fn select_action(
             &mut self,
-            _data: u64,
+            _data: CompactState,
             _mechanics: &QGameMechanics,
             action_mask: &[bool],
         ) -> anyhow::Result<(usize, Vec<f32>)> {

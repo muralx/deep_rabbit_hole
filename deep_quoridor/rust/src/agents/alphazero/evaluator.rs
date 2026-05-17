@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use ort::session::Session;
 
 use crate::agents::onnx_agent::softmax;
+use crate::compact::q_bit_repr::CompactState;
 use crate::compact::q_game_mechanics::QGameMechanics;
 use crate::grid_helpers::compact_state_to_resnet_input;
 use crate::rotation::{create_rotation_mapping, remap_mask, remap_policy, rotate_compact_state};
@@ -16,7 +17,7 @@ use crate::rotation::{create_rotation_mapping, remap_mask, remap_policy, rotate_
 pub trait Evaluator {
     fn evaluate(
         &mut self,
-        data: u64,
+        data: CompactState,
         mechanics: &QGameMechanics,
         action_mask: &[bool],
     ) -> Result<(f32, Vec<f32>)>;
@@ -53,7 +54,7 @@ impl OnnxEvaluator {
 impl Evaluator for OnnxEvaluator {
     fn evaluate(
         &mut self,
-        data: u64,
+        data: CompactState,
         mechanics: &QGameMechanics,
         action_mask: &[bool],
     ) -> Result<(f32, Vec<f32>)> {
@@ -121,7 +122,7 @@ impl Evaluator for OnnxEvaluator {
 impl Evaluator for UniformMockEvaluator {
     fn evaluate(
         &mut self,
-        _data: u64,
+        _data: CompactState,
         _mechanics: &QGameMechanics,
         action_mask: &[bool],
     ) -> Result<(f32, Vec<f32>)> {

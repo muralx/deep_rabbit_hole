@@ -8,6 +8,7 @@ use anyhow::Result;
 use rand::Rng;
 
 use crate::agents::{ActionSelectionTrace, ActionSelector};
+use crate::compact::q_bit_repr::CompactState;
 use crate::compact::q_game_mechanics::QGameMechanics;
 
 use super::evaluator::OnnxEvaluator;
@@ -118,7 +119,7 @@ pub fn apply_temperature_and_sample(
 pub struct AlphaZeroAgent {
     evaluator: OnnxEvaluator,
     config: AlphaZeroAgentConfig,
-    visited_states: HashSet<u64>,
+    visited_states: HashSet<CompactState>,
     last_selection_trace: Option<ActionSelectionTrace>,
 }
 
@@ -144,7 +145,7 @@ impl AlphaZeroAgent {
 impl ActionSelector for AlphaZeroAgent {
     fn select_action(
         &mut self,
-        data: u64,
+        data: CompactState,
         mechanics: &QGameMechanics,
         action_mask: &[bool],
     ) -> Result<(usize, Vec<f32>)> {
@@ -197,8 +198,8 @@ impl ActionSelector for AlphaZeroAgent {
         }
 
         // Optionally add the resulting state to the visited set.
-        // Keyed on raw u64 state including completed_steps; a position seen at
-        // two different step counts is treated as two states.
+        // Keyed on the compact state including completed_steps; a position seen
+        // at two different step counts is treated as two states.
         if self.config.penalize_visited_states {
             let mut next_data = data;
             mechanics.apply_action_index(&mut next_data, selected_idx);

@@ -2,6 +2,7 @@
 //!
 //! All agents implement the [`ActionSelector`] trait.
 
+use crate::compact::q_bit_repr::CompactState;
 use crate::compact::q_game_mechanics::QGameMechanics;
 
 #[cfg(feature = "binary")]
@@ -28,7 +29,7 @@ pub trait ActionSelector {
     /// full softmax output (or a uniform/mask-based distribution for simpler agents).
     fn select_action(
         &mut self,
-        data: u64,
+        data: CompactState,
         mechanics: &QGameMechanics,
         action_mask: &[bool],
     ) -> anyhow::Result<(usize, Vec<f32>)>;

@@ -1,4 +1,4 @@
-use super::q_bit_repr::QBitRepr;
+use super::q_bit_repr::{CompactState, QBitRepr};
 /// Conversion functions between QBitRepr packed format and game state arrays.
 ///
 /// This module contains methods for converting between the bit-packed representation
@@ -17,7 +17,7 @@ impl QBitRepr {
     /// * `completed_steps` - Number of steps completed so far
     pub fn from_game_state(
         &self,
-        data: &mut u64,
+        data: &mut CompactState,
         grid: &ArrayView2<i8>,
         player_positions: &ArrayView2<i32>,
         walls_remaining: &ArrayView1<i32>,
@@ -71,7 +71,7 @@ impl QBitRepr {
     /// Extract player positions as a 2x2 array (format used by minimax)
     /// Returns [[p1_row, p1_col], [p2_row, p2_col]]
     #[allow(dead_code)]
-    pub fn to_player_positions(&self, data: u64) -> Array2<i32> {
+    pub fn to_player_positions(&self, data: CompactState) -> Array2<i32> {
         let (p1_row, p1_col) = self.get_player_position(data, 0);
         let (p2_row, p2_col) = self.get_player_position(data, 1);
 
@@ -85,7 +85,7 @@ impl QBitRepr {
     /// Extract walls remaining as a 1D array (format used by minimax)
     /// Returns [p1_walls, p2_walls]
     #[allow(dead_code)]
-    pub fn to_walls_remaining(&self, data: u64) -> Array1<i32> {
+    pub fn to_walls_remaining(&self, data: CompactState) -> Array1<i32> {
         Array1::from_vec(vec![
             self.get_walls_remaining(data, 0) as i32,
             self.get_walls_remaining(data, 1) as i32,
@@ -95,7 +95,7 @@ impl QBitRepr {
     /// Reconstruct the full grid with walls and player positions
     /// This creates a grid in the format used by minimax: (2*board_size + 3) x (2*board_size + 3)
     #[allow(dead_code)]
-    pub fn to_grid(&self, data: u64) -> Array2<i8> {
+    pub fn to_grid(&self, data: CompactState) -> Array2<i8> {
         use crate::grid::{CELL_FREE, CELL_PLAYER1, CELL_PLAYER2, CELL_WALL};
 
         let grid_size = 2 * self.board_size() + 3;

@@ -3,6 +3,7 @@
 use rand::Rng;
 
 use crate::agents::ActionSelector;
+use crate::compact::q_bit_repr::CompactState;
 use crate::compact::q_game_mechanics::QGameMechanics;
 
 /// An agent that selects a random valid action.
@@ -27,7 +28,7 @@ impl Default for RandomAgent {
 impl ActionSelector for RandomAgent {
     fn select_action(
         &mut self,
-        _data: u64,
+        _data: CompactState,
         _mechanics: &QGameMechanics,
         action_mask: &[bool],
     ) -> anyhow::Result<(usize, Vec<f32>)> {
@@ -58,7 +59,7 @@ impl ActionSelector for RandomAgent {
 mod tests {
     use super::*;
 
-    fn make_mech() -> (QGameMechanics, u64) {
+    fn make_mech() -> (QGameMechanics, CompactState) {
         let mech = QGameMechanics::new(5, 3, 200);
         let data = mech.create_initial_state();
         (mech, data)

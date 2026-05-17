@@ -10,7 +10,7 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::actions::{action_index_to_action, action_to_index, policy_size, ACTION_MOVE};
-use crate::compact::q_bit_repr::{WALL_HORIZONTAL, WALL_VERTICAL};
+use crate::compact::q_bit_repr::{CompactState, WALL_HORIZONTAL, WALL_VERTICAL};
 use crate::compact::q_game_mechanics::QGameMechanics;
 use crate::game_state::GameState;
 
@@ -117,14 +117,14 @@ pub fn remap_mask(mask: &[bool], mapping: &[usize]) -> Vec<bool> {
     out
 }
 
-/// Build a 180°-rotated u64 game state.
+/// Build a 180°-rotated compact game state.
 ///
 /// Mirrors `build_rotated_state` semantics for the compact representation:
 /// - Player positions flipped: `(r,c) -> (bs-1-r, bs-1-c)` for both players.
 /// - All wall positions flipped: `(r,c,o) -> (ws-1-r, ws-1-c, o)` where `ws = bs-1`.
 ///   Orientation is preserved under 180° rotation.
 /// - Walls remaining, current player, completed steps: unchanged.
-pub fn rotate_compact_state(mechanics: &QGameMechanics, data: u64) -> u64 {
+pub fn rotate_compact_state(mechanics: &QGameMechanics, data: CompactState) -> CompactState {
     let repr = mechanics.repr();
     let bs = repr.board_size();
     let ws = bs - 1;
@@ -256,8 +256,7 @@ mod tests {
 
     #[test]
     fn test_rotate_compact_state_matches_build_rotated_state_initial() {
-        // QBitRepr packs state into a u64; only smaller boards fit.
-        for bs in [3, 5] {
+        for bs in [3, 5, 9] {
             let state = GameState::new(bs, 3);
             let rotated_state = build_rotated_state(&state);
 

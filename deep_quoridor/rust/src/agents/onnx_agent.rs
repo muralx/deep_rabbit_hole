@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use ort::session::Session;
 
 use crate::agents::ActionSelector;
+use crate::compact::q_bit_repr::CompactState;
 use crate::compact::q_game_mechanics::QGameMechanics;
 use crate::grid_helpers::compact_state_to_resnet_input;
 
@@ -36,7 +37,7 @@ impl OnnxAgent {
 impl ActionSelector for OnnxAgent {
     fn select_action(
         &mut self,
-        data: u64,
+        data: CompactState,
         mechanics: &QGameMechanics,
         action_mask: &[bool],
     ) -> Result<(usize, Vec<f32>)> {
