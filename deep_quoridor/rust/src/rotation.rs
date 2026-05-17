@@ -272,6 +272,39 @@ mod tests {
         }
     }
 
+    /// Pins the contract that callers must NOT compute the rotated action mask
+    /// via `mechanics.get_action_mask_immut(rotate_compact_state(data))`.
+    /// `QGameMechanics` owns `goal_rows` and does not flip them under rotation,
+    /// so wall placements that would block the rotated player's path are
+    /// silently treated as legal. The correct rotated mask is
+    /// `remap_mask(original_mask, original_to_rotated)`.
+    #[test]
+    fn test_remap_mask_matches_gamestate_rotated_mask_with_walls() {
+        use crate::compact::q_game_mechanics::QGameMechanics;
+
+        let bs = 5;
+        let mut state = GameState::new(bs, 2);
+        let mech = QGameMechanics::new(bs as usize, 2, 200);
+        let mut data = mech.create_initial_state();
+
+        // A sequence that places two vertical walls and leaves it as player 1's
+        // turn — the configuration where the goal-row bug surfaces.
+        let action_indices: [usize; 5] = [1, 23, 25, 27, 2];
+        for &ai in &action_indices {
+            let action = action_index_to_action(bs, ai);
+            state.step(action);
+            mech.apply_action_index(&mut data, ai);
+        }
+        assert_eq!(state.current_player, 1);
+
+        let original_mask = mech.get_action_mask_immut(data);
+        let (orig_to_rot, _) = create_rotation_mapping(bs);
+        let remapped = remap_mask(&original_mask, &orig_to_rot);
+
+        let gs_rotated_mask = build_rotated_state(&state).get_action_mask();
+        assert_eq!(remapped, gs_rotated_mask);
+    }
+
     #[test]
     fn test_remap_policy_roundtrip() {
         let bs = 5;

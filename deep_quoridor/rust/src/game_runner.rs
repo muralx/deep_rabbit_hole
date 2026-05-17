@@ -14,7 +14,7 @@ use crate::agents::ActionSelector;
 use crate::compact::q_game_mechanics::QGameMechanics;
 use crate::game_state::GameState;
 use crate::grid_helpers::compact_state_to_resnet_input;
-use crate::rotation::{create_rotation_mapping, remap_policy, rotate_compact_state};
+use crate::rotation::{create_rotation_mapping, remap_mask, remap_policy, rotate_compact_state};
 
 pub trait PlayGameObserver {
     fn on_state_snapshot(&mut self, step: usize, state: &GameState, action_mask: &[bool]);
@@ -155,7 +155,11 @@ pub fn play_game(
                 .index_axis(ndarray::Axis(0), 0)
                 .to_owned();
             let rotated_policy = remap_policy(&policy, &original_to_rotated);
-            let rotated_mask = mechanics.get_action_mask_immut(rotated_data);
+            // `QGameMechanics::goal_rows` does not flip under rotation, so the
+            // mask must come from remapping the original mask, not from
+            // re-validating on rotated data (which would treat walls that
+            // block the rotated player's path as legal).
+            let rotated_mask = remap_mask(&mask, &original_to_rotated);
             (rotated_input, rotated_policy, rotated_mask)
         } else {
             (

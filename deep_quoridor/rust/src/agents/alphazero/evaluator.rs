@@ -8,7 +8,7 @@ use ort::session::Session;
 use crate::agents::onnx_agent::softmax;
 use crate::compact::q_game_mechanics::QGameMechanics;
 use crate::grid_helpers::compact_state_to_resnet_input;
-use crate::rotation::{create_rotation_mapping, remap_policy, rotate_compact_state};
+use crate::rotation::{create_rotation_mapping, remap_mask, remap_policy, rotate_compact_state};
 
 /// Trait for evaluating game positions.
 ///
@@ -28,7 +28,7 @@ pub trait Evaluator {
 /// returning both a value estimate and policy priors.
 pub struct OnnxEvaluator {
     session: Session,
-    rotated_to_original_by_board_size: HashMap<i32, Vec<usize>>,
+    rotation_mappings_by_board_size: HashMap<i32, (Vec<usize>, Vec<usize>)>,
 }
 
 /// Deterministic evaluator for cross-language consistency tests.
@@ -45,7 +45,7 @@ impl OnnxEvaluator {
             .context("Failed to load ONNX model")?;
         Ok(Self {
             session,
-            rotated_to_original_by_board_size: HashMap::new(),
+            rotation_mappings_by_board_size: HashMap::new(),
         })
     }
 }
@@ -60,19 +60,22 @@ impl Evaluator for OnnxEvaluator {
         let bs = mechanics.repr().board_size() as i32;
         let current_player = mechanics.repr().get_current_player(data);
 
-        let rotated_to_original = self
-            .rotated_to_original_by_board_size
+        let mappings = self
+            .rotation_mappings_by_board_size
             .entry(bs)
-            .or_insert_with(|| create_rotation_mapping(bs).1);
+            .or_insert_with(|| create_rotation_mapping(bs));
+        let (orig_to_rot, rot_to_orig) = (&mappings.0, &mappings.1);
 
-        let (work_data, work_action_mask, rotated_to_original) = if current_player == 1 {
+        // For player 1, the network always sees the board rotated 180° so the
+        // current player faces downward. The compact rotation matches the tensor
+        // of `build_rotated_state`, but `QGameMechanics::goal_rows` is owned by
+        // the mechanics and does not flip — so wall-mask validation on rotated
+        // data treats walls that block the rotated player's path as legal. Remap
+        // the (correct) original mask into rotated index space instead.
+        let (work_data, work_action_mask, rot_to_orig_slice) = if current_player == 1 {
             let rotated_data = rotate_compact_state(mechanics, data);
-            let rotated_mask = mechanics.get_action_mask_immut(rotated_data);
-            (
-                rotated_data,
-                rotated_mask,
-                Some(rotated_to_original.as_slice()),
-            )
+            let rotated_mask = remap_mask(action_mask, orig_to_rot);
+            (rotated_data, rotated_mask, Some(rot_to_orig.as_slice()))
         } else {
             (data, action_mask.to_vec(), None)
         };
@@ -105,7 +108,7 @@ impl Evaluator for OnnxEvaluator {
 
         // Apply masked softmax to get priors
         let priors_work = masked_softmax(policy_logits.1, &work_action_mask);
-        let priors = if let Some(rot_to_orig) = rotated_to_original {
+        let priors = if let Some(rot_to_orig) = rot_to_orig_slice {
             remap_policy(&priors_work, rot_to_orig)
         } else {
             priors_work
