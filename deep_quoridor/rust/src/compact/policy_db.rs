@@ -4,15 +4,16 @@
 /// with a transposition table.
 ///
 /// Storage: Parquet file with two columns (`state`, `value`), sorted by
-/// `state`. The footer holds key/value metadata (board_size, max_walls,
-/// max_steps, num_states). Row-group min/max statistics on `state` are
-/// used to prune lookups; we never load the entire DB into memory.
+/// `state` bytes (lex order). The footer holds key/value metadata
+/// (board_size, max_walls, max_steps, num_states). Row-group min/max
+/// statistics on `state` are used to prune lookups; we never load the
+/// entire DB into memory.
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{Array, Int64Array, Int8Array, RecordBatch};
+use arrow::array::{Array, FixedSizeBinaryArray, Int8Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use dashmap::DashMap;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
@@ -25,10 +26,14 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 
+use super::q_bit_repr::CompactState;
 use super::q_game_mechanics::QGameMechanics;
 
+/// Width of the on-disk / in-memory byte representation of a state.
+pub const STATE_BYTES: usize = 24;
+
 /// Transposition table type alias.
-pub type TranspositionTable = DashMap<u64, i8>;
+pub type TranspositionTable = DashMap<CompactState, i8>;
 
 /// Number of rows per Parquet row group. Larger means fewer groups (less
 /// per-group overhead) but larger decode units. 1M is a good general default.
@@ -40,22 +45,20 @@ const ROW_GROUP_SIZE: usize = 1_000_000;
 const WRITE_CHUNK_SIZE: usize = 65_536;
 
 /// Per-row-group statistics cached at open time, used to prune lookups.
-/// State values are stored in the Parquet file as `Int64` (the same 64
-/// bits as the underlying `u64`). All comparisons here are signed `i64`,
-/// matching the Parquet sort/statistics ordering. Callers convert to/from
-/// `u64` via `as` casts at the boundary.
+/// State values are stored as `FixedSizeBinary(24)`; comparisons use
+/// lexicographic byte order, matching the Parquet sort/statistics ordering.
 #[derive(Clone, Debug)]
 struct RowGroupStats {
     idx: usize,
-    min: i64,
-    max: i64,
+    min: [u8; STATE_BYTES],
+    max: [u8; STATE_BYTES],
     num_rows: u64,
 }
 
 /// Decoded contents of one row group, kept around when we want to reuse
 /// it across nearby lookups in the same call.
 struct DecodedRowGroup {
-    states: Vec<i64>,
+    states: Vec<CompactState>,
     values: Vec<i8>,
 }
 
@@ -72,15 +75,15 @@ enum Storage {
         cum_rows: Vec<u64>,
     },
     Eager {
-        /// File order (= sorted by state-as-i64). Indexable by `rowid - 1`.
-        ordered: Vec<(u64, i8)>,
+        /// File order (= sorted by state bytes lex). Indexable by `rowid - 1`.
+        ordered: Vec<(CompactState, i8)>,
         /// O(1) point lookups for `lookup_values_by_state`.
-        table: HashMap<u64, i8>,
+        table: HashMap<CompactState, i8>,
     },
 }
 
 /// Parquet-backed policy database for storing and querying pre-computed
-/// minimax values. Single file per DB; sorted by `state` for efficient
+/// minimax values. Single file per DB; sorted by `state` bytes for efficient
 /// row-group pruning on point lookups.
 pub struct PolicyDb {
     storage: Storage,
@@ -93,7 +96,11 @@ pub struct PolicyDb {
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("state", DataType::Int64, false),
+        Field::new(
+            "state",
+            DataType::FixedSizeBinary(STATE_BYTES as i32),
+            false,
+        ),
         Field::new("value", DataType::Int8, false),
     ]))
 }
@@ -105,11 +112,33 @@ fn parse_meta(kv: Option<&Vec<KeyValue>>, key: &str) -> Option<usize> {
         .and_then(|v| v.parse().ok())
 }
 
+fn bytes_to_state(b: &[u8]) -> Result<CompactState, Box<dyn std::error::Error>> {
+    if b.len() != STATE_BYTES {
+        return Err(format!(
+            "state column row width is {}, expected {STATE_BYTES}",
+            b.len()
+        )
+        .into());
+    }
+    let mut a = [0u8; STATE_BYTES];
+    a.copy_from_slice(b);
+    Ok(CompactState::from_bytes(a))
+}
+
+fn slice_to_arr(b: &[u8]) -> Result<[u8; STATE_BYTES], Box<dyn std::error::Error>> {
+    if b.len() != STATE_BYTES {
+        return Err(format!("stat byte width is {}, expected {STATE_BYTES}", b.len()).into());
+    }
+    let mut a = [0u8; STATE_BYTES];
+    a.copy_from_slice(b);
+    Ok(a)
+}
+
 impl PolicyDb {
     /// Open an existing policy database for reading.
     ///
     /// When `lazy` is `false` (the default for callers), the entire dataset
-    /// is decoded into a `HashMap<u64, i8>` at open time so subsequent
+    /// is decoded into a `HashMap<CompactState, i8>` at open time so subsequent
     /// state lookups are O(1). When `lazy` is `true`, lookups walk Parquet
     /// row groups on demand using the file's min/max statistics; useful for
     /// DBs too large to fit in memory.
@@ -142,9 +171,9 @@ impl PolicyDb {
                 .statistics()
                 .ok_or_else(|| format!("row group {i} missing statistics on state column"))?;
             let (min, max) = match stats {
-                Statistics::Int64(s) => (
-                    *s.min_opt().ok_or("missing min stat on state")?,
-                    *s.max_opt().ok_or("missing max stat on state")?,
+                Statistics::FixedLenByteArray(s) => (
+                    slice_to_arr(s.min_opt().ok_or("missing min stat on state")?.as_ref())?,
+                    slice_to_arr(s.max_opt().ok_or("missing max stat on state")?.as_ref())?,
                 ),
                 _ => {
                     return Err(
@@ -180,16 +209,16 @@ impl PolicyDb {
             let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata.clone())
                 .build()?;
 
-            let mut state_buf: Vec<i64> = Vec::with_capacity(num_states);
+            let mut state_buf: Vec<CompactState> = Vec::with_capacity(num_states);
             let mut value_buf: Vec<i8> = Vec::with_capacity(num_states);
             for batch in reader {
                 let batch = batch?;
                 append_batch(&batch, &mut state_buf, &mut value_buf)?;
             }
 
-            let mut ordered: Vec<(u64, i8)> = Vec::with_capacity(state_buf.len());
+            let mut ordered: Vec<(CompactState, i8)> = Vec::with_capacity(state_buf.len());
             for (s, v) in state_buf.into_iter().zip(value_buf.into_iter()) {
-                ordered.push((s as u64, v));
+                ordered.push((s, v));
             }
             let mut table = HashMap::with_capacity(ordered.len());
             for &(s, v) in &ordered {
@@ -259,7 +288,7 @@ impl PolicyDb {
     /// Values are returned from the acting player's perspective.
     pub fn lookup_action_values(
         &self,
-        data: u64,
+        data: CompactState,
     ) -> Result<Option<(Vec<(u8, u8, u8)>, Vec<i32>)>, Box<dyn std::error::Error>> {
         let mechanics = &self.mechanics;
         let cp = mechanics.repr().get_current_player(data);
@@ -315,7 +344,7 @@ impl PolicyDb {
         }
 
         // Batch-look up all non-terminal children in one sorted sweep.
-        let need_lookup: Vec<u64> = child_states
+        let need_lookup: Vec<CompactState> = child_states
             .iter()
             .zip(terminal_p0.iter())
             .filter(|(_, t)| t.is_none())
@@ -323,7 +352,7 @@ impl PolicyDb {
             .collect();
 
         let lookup_pairs = self.lookup_values_by_state(&need_lookup)?;
-        let lookup_map: HashMap<u64, i32> = lookup_pairs.into_iter().collect();
+        let lookup_map: HashMap<CompactState, i32> = lookup_pairs.into_iter().collect();
 
         let mut values = Vec::with_capacity(actions.len());
         let mut any_found = false;
@@ -360,7 +389,7 @@ impl PolicyDb {
     pub fn fetch_states_by_rowid(
         &self,
         rowids: &[i64],
-    ) -> Result<Vec<(u64, i32)>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<(CompactState, i32)>, Box<dyn std::error::Error>> {
         if rowids.is_empty() {
             return Ok(Vec::new());
         }
@@ -425,7 +454,7 @@ impl PolicyDb {
                         current_rg = Some(rg_idx);
                     }
                     let dec = decoded.as_ref().unwrap();
-                    let s = dec.states[row_in_group] as u64;
+                    let s = dec.states[row_in_group];
                     let v = dec.values[row_in_group] as i32;
                     results.push((s, v));
                 }
@@ -443,8 +472,8 @@ impl PolicyDb {
     /// decoding each at most once.
     pub fn lookup_values_by_state(
         &self,
-        states: &[u64],
-    ) -> Result<Vec<(u64, i32)>, Box<dyn std::error::Error>> {
+        states: &[CompactState],
+    ) -> Result<Vec<(CompactState, i32)>, Box<dyn std::error::Error>> {
         if states.is_empty() {
             return Ok(Vec::new());
         }
@@ -460,7 +489,8 @@ impl PolicyDb {
                 row_groups,
                 ..
             } => {
-                let mut sorted: Vec<i64> = states.iter().map(|&s| s as i64).collect();
+                let mut sorted: Vec<[u8; STATE_BYTES]> =
+                    states.iter().map(|s| s.to_bytes()).collect();
                 sorted.sort_unstable();
                 sorted.dedup();
 
@@ -481,11 +511,17 @@ impl PolicyDb {
                         // q is in [min, max]; decode this row group once and
                         // resolve every query whose value falls in the range.
                         let decoded = Self::decode_row_group(path, metadata, rg)?;
+                        // Build a sorted bytes view of the decoded states for binary search.
+                        let decoded_bytes: Vec<[u8; STATE_BYTES]> =
+                            decoded.states.iter().map(|s| s.to_bytes()).collect();
                         while q_idx < sorted.len() && sorted[q_idx] <= rg.max {
                             let q2 = sorted[q_idx];
                             if q2 >= rg.min {
-                                if let Ok(pos) = decoded.states.binary_search(&q2) {
-                                    results.push((q2 as u64, decoded.values[pos] as i32));
+                                if let Ok(pos) = decoded_bytes.binary_search(&q2) {
+                                    results.push((
+                                        CompactState::from_bytes(q2),
+                                        decoded.values[pos] as i32,
+                                    ));
                                 }
                             }
                             q_idx += 1;
@@ -512,15 +548,14 @@ impl PolicyDb {
         max_walls: usize,
         step_interval: usize,
     ) -> Result<usize, Box<dyn std::error::Error>> {
-        // Drain DashMap, apply step_interval filter, sort by state.
-        // Sort uses i64 so the on-disk order matches the read-time
-        // statistics ordering (Parquet Int64 stats are signed).
-        let mut rows: Vec<(i64, i8)> = entries
+        // Drain DashMap, apply step_interval filter, sort by state bytes
+        // (matches Parquet FixedSizeBinary statistics ordering).
+        let mut rows: Vec<([u8; STATE_BYTES], i8)> = entries
             .into_iter()
             .filter_map(|(s, v)| {
                 let steps = mechanics.repr().get_completed_steps(s);
                 if steps % step_interval == 0 {
-                    Some((s as i64, v))
+                    Some((s.to_bytes(), v))
                 } else {
                     None
                 }
@@ -560,14 +595,13 @@ impl PolicyDb {
 
         // Stream rows in moderate chunks so we don't allocate one giant batch.
         for chunk in rows.chunks(WRITE_CHUNK_SIZE) {
-            let states: Vec<i64> = chunk.iter().map(|(s, _)| *s).collect();
+            let states_arr = Arc::new(FixedSizeBinaryArray::try_from_iter(
+                chunk.iter().map(|(s, _)| s.to_vec()),
+            )?);
             let values: Vec<i8> = chunk.iter().map(|(_, v)| *v).collect();
             let batch = RecordBatch::try_new(
                 schema.clone(),
-                vec![
-                    Arc::new(Int64Array::from(states)),
-                    Arc::new(Int8Array::from(values)),
-                ],
+                vec![states_arr, Arc::new(Int8Array::from(values))],
             )?;
             writer.write(&batch)?;
         }
@@ -580,26 +614,36 @@ impl PolicyDb {
 /// Append a record batch's two columns to the running state/value vectors.
 fn append_batch(
     batch: &RecordBatch,
-    states: &mut Vec<i64>,
+    states: &mut Vec<CompactState>,
     values: &mut Vec<i8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let s_col = batch
         .column(0)
         .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or("state column is not Int64")?;
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .ok_or("state column is not FixedSizeBinary")?;
     let v_col = batch
         .column(1)
         .as_any()
         .downcast_ref::<Int8Array>()
         .ok_or("value column is not Int8")?;
-    states.extend_from_slice(s_col.values());
+    if s_col.value_length() != STATE_BYTES as i32 {
+        return Err(format!(
+            "state column width {} != expected {}",
+            s_col.value_length(),
+            STATE_BYTES
+        )
+        .into());
+    }
+    for i in 0..s_col.len() {
+        states.push(bytes_to_state(s_col.value(i))?);
+    }
     values.extend_from_slice(v_col.values());
     Ok(())
 }
 
 /// Get all valid actions (moves + wall placements) for the current player.
-fn get_all_actions(mechanics: &QGameMechanics, data: &mut u64) -> Vec<(u8, u8, u8)> {
+fn get_all_actions(mechanics: &QGameMechanics, data: &mut CompactState) -> Vec<(u8, u8, u8)> {
     let moves = mechanics.get_valid_moves(*data);
     let mut actions: Vec<(u8, u8, u8)> = moves
         .into_iter()
@@ -625,7 +669,7 @@ fn get_all_actions(mechanics: &QGameMechanics, data: &mut u64) -> Vec<(u8, u8, u
 /// transposition table for later export to a policy database.
 pub fn minimax(
     mechanics: &QGameMechanics,
-    data: &mut u64,
+    data: &mut CompactState,
     transposition_table: &TranspositionTable,
 ) -> i8 {
     minimax_inner(mechanics, data, transposition_table, None)
@@ -633,7 +677,7 @@ pub fn minimax(
 
 fn minimax_inner(
     mechanics: &QGameMechanics,
-    data: &mut u64,
+    data: &mut CompactState,
     transposition_table: &TranspositionTable,
     mut rng: Option<&mut StdRng>,
 ) -> i8 {
@@ -716,7 +760,7 @@ fn minimax_inner(
 /// transposition table. Returns the root value.
 pub fn minimax_lazy_smp(
     mechanics: &QGameMechanics,
-    data: &mut u64,
+    data: &mut CompactState,
     transposition_table: &TranspositionTable,
     num_threads: usize,
 ) -> i8 {
@@ -807,7 +851,8 @@ mod tests {
         assert!(!table.is_empty());
 
         // Snapshot expected entries before write() drains the DashMap.
-        let expected: Vec<(u64, i8)> = table.iter().map(|kv| (*kv.key(), *kv.value())).collect();
+        let expected: Vec<(CompactState, i8)> =
+            table.iter().map(|kv| (*kv.key(), *kv.value())).collect();
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.parquet");
@@ -826,10 +871,10 @@ mod tests {
         assert_eq!(db.count_states().unwrap(), expected.len());
 
         // Round-trip every entry by state lookup.
-        let states: Vec<u64> = expected.iter().map(|(s, _)| *s).collect();
+        let states: Vec<CompactState> = expected.iter().map(|(s, _)| *s).collect();
         let pairs = db.lookup_values_by_state(&states).unwrap();
         assert_eq!(pairs.len(), expected.len());
-        let got_map: HashMap<u64, i32> = pairs.into_iter().collect();
+        let got_map: HashMap<CompactState, i32> = pairs.into_iter().collect();
         for (s, v) in &expected {
             assert_eq!(got_map.get(s), Some(&(*v as i32)));
         }
@@ -838,7 +883,7 @@ mod tests {
         let all_ids: Vec<i64> = (1..=expected.len() as i64).collect();
         let by_id = db.fetch_states_by_rowid(&all_ids).unwrap();
         assert_eq!(by_id.len(), expected.len());
-        let by_id_map: HashMap<u64, i32> = by_id.into_iter().collect();
+        let by_id_map: HashMap<CompactState, i32> = by_id.into_iter().collect();
         for (s, v) in &expected {
             assert_eq!(by_id_map.get(s), Some(&(*v as i32)));
         }
@@ -888,7 +933,8 @@ mod tests {
         let mut root = mechanics.create_initial_state();
         let table = TranspositionTable::new();
         minimax(&mechanics, &mut root, &table);
-        let expected: Vec<(u64, i8)> = table.iter().map(|kv| (*kv.key(), *kv.value())).collect();
+        let expected: Vec<(CompactState, i8)> =
+            table.iter().map(|kv| (*kv.key(), *kv.value())).collect();
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.parquet");
@@ -907,11 +953,11 @@ mod tests {
 
         // Same lookup_values_by_state results (sort both since order isn't
         // guaranteed across modes).
-        let states: Vec<u64> = expected.iter().map(|(s, _)| *s).collect();
+        let states: Vec<CompactState> = expected.iter().map(|(s, _)| *s).collect();
         let mut e_pairs = eager.lookup_values_by_state(&states).unwrap();
         let mut l_pairs = lazy.lookup_values_by_state(&states).unwrap();
-        e_pairs.sort_unstable_by_key(|(s, _)| *s);
-        l_pairs.sort_unstable_by_key(|(s, _)| *s);
+        e_pairs.sort_unstable_by_key(|(s, _)| s.to_bytes());
+        l_pairs.sort_unstable_by_key(|(s, _)| s.to_bytes());
         assert_eq!(e_pairs, l_pairs);
         assert_eq!(e_pairs.len(), expected.len());
 

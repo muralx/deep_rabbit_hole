@@ -1,8 +1,10 @@
 gymnasium
 maturin
 matplotlib
-numba
+numba<=0.61
 numpy
+onnx
+onnxscript
 open_spiel
 pettingzoo
 prettytable

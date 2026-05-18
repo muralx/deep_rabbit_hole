@@ -6,8 +6,9 @@ use anyhow::{Context, Result};
 use ort::session::Session;
 
 use crate::agents::ActionSelector;
-use crate::game_state::GameState;
-use crate::grid_helpers::grid_game_state_to_resnet_input;
+use crate::compact::q_bit_repr::CompactState;
+use crate::compact::q_game_mechanics::QGameMechanics;
+use crate::grid_helpers::compact_state_to_resnet_input;
 
 /// Compute softmax of a slice of logits.
 pub fn softmax(logits: &[f32]) -> Vec<f32> {
@@ -36,11 +37,12 @@ impl OnnxAgent {
 impl ActionSelector for OnnxAgent {
     fn select_action(
         &mut self,
-        state: &GameState,
+        data: CompactState,
+        mechanics: &QGameMechanics,
         action_mask: &[bool],
     ) -> Result<(usize, Vec<f32>)> {
         // Build ResNet input tensor
-        let resnet_input = grid_game_state_to_resnet_input(state);
+        let resnet_input = compact_state_to_resnet_input(mechanics, data);
 
         // Convert to flat vec for ORT
         let shape = resnet_input.shape().to_vec();

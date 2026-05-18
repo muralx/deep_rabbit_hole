@@ -8,7 +8,8 @@ use anyhow::Result;
 use rand::Rng;
 
 use crate::agents::{ActionSelectionTrace, ActionSelector};
-use crate::game_state::GameState;
+use crate::compact::q_bit_repr::CompactState;
+use crate::compact::q_game_mechanics::QGameMechanics;
 
 use super::evaluator::OnnxEvaluator;
 use super::mcts::{search, MCTSConfig};
@@ -118,7 +119,7 @@ pub fn apply_temperature_and_sample(
 pub struct AlphaZeroAgent {
     evaluator: OnnxEvaluator,
     config: AlphaZeroAgentConfig,
-    visited_states: HashSet<u64>,
+    visited_states: HashSet<CompactState>,
     last_selection_trace: Option<ActionSelectionTrace>,
 }
 
@@ -144,7 +145,8 @@ impl AlphaZeroAgent {
 impl ActionSelector for AlphaZeroAgent {
     fn select_action(
         &mut self,
-        state: &GameState,
+        data: CompactState,
+        mechanics: &QGameMechanics,
         action_mask: &[bool],
     ) -> Result<(usize, Vec<f32>)> {
         // Run MCTS search - only pass visited states when penalization is enabled
@@ -156,7 +158,8 @@ impl ActionSelector for AlphaZeroAgent {
         };
         let (children, root_value) = search(
             &self.config.mcts,
-            state.clone(),
+            data,
+            mechanics,
             &mut self.evaluator,
             visited_ref,
         )?;
@@ -166,8 +169,9 @@ impl ActionSelector for AlphaZeroAgent {
         let action_indices: Vec<usize> = children.iter().map(|c| c.action_index).collect();
 
         // Determine effective temperature
+        let completed_steps = mechanics.repr().get_completed_steps(data);
         let temperature = if let Some(threshold) = self.config.drop_t_on_step {
-            if state.completed_steps >= threshold {
+            if completed_steps >= threshold {
                 0.0
             } else {
                 self.config.temperature
@@ -193,16 +197,13 @@ impl ActionSelector for AlphaZeroAgent {
             }
         }
 
-        // Optionally add state to visited set
+        // Optionally add the resulting state to the visited set.
+        // Keyed on the compact state including completed_steps; a position seen
+        // at two different step counts is treated as two states.
         if self.config.penalize_visited_states {
-            // Get the hash of the resulting state after taking the action
-            let action = children
-                .iter()
-                .find(|c| c.action_index == selected_idx)
-                .map(|c| c.action)
-                .unwrap_or([0, 0, 2]);
-            let next_state = state.clone_and_step(action);
-            self.visited_states.insert(next_state.get_fast_hash());
+            let mut next_data = data;
+            mechanics.apply_action_index(&mut next_data, selected_idx);
+            self.visited_states.insert(next_data);
         }
 
         self.last_selection_trace = Some(ActionSelectionTrace {

@@ -29,7 +29,7 @@
         "source.organizeImports": "explicit"
     },
     "rust-analyzer.linkedProjects": [
-        "./deep_quoridor/rust/Cargo.toml"
+        "${workspaceFolder}/deep_quoridor/rust/Cargo.toml"
     ],
     "python-envs.pythonProjects": [],
     "chat.tools.terminal.outputLocation": "terminal",

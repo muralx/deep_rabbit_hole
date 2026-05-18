@@ -5,6 +5,8 @@ use numpy::{
 };
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use pyo3::types::PyBytes;
 
 pub mod actions;
 pub mod compact;
@@ -454,6 +456,20 @@ fn policy_db_lookup<'py>(
     }
 }
 
+/// Decode a Python bytes-like state into a CompactState.
+#[cfg(feature = "python")]
+fn state_from_bytes(state: &[u8]) -> PyResult<compact::q_bit_repr::CompactState> {
+    if state.len() != 24 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "state must be 24 bytes, got {}",
+            state.len()
+        )));
+    }
+    let mut buf = [0u8; 24];
+    buf.copy_from_slice(state);
+    Ok(compact::q_bit_repr::CompactState::from_bytes(buf))
+}
+
 /// Convert a compact state blob to full game state arrays.
 ///
 /// Returns (grid, player_positions, walls_remaining, old_style_walls, current_player, completed_steps).
@@ -461,20 +477,21 @@ fn policy_db_lookup<'py>(
 #[pyfunction]
 fn compact_state_to_game_state<'py>(
     py: Python<'py>,
-    state: u64,
+    state: Vec<u8>,
     board_size: usize,
     max_walls: usize,
     max_steps: usize,
-) -> (
+) -> PyResult<(
     Bound<'py, PyArray2<i8>>,
     Bound<'py, PyArray2<i32>>,
     Bound<'py, PyArray1<i32>>,
     Bound<'py, PyArray3<i8>>,
     i32,
     i32,
-) {
+)> {
     use compact::q_bit_repr::QBitRepr;
 
+    let state = state_from_bytes(&state)?;
     let repr = QBitRepr::new(board_size, max_walls, max_steps);
 
     let grid = repr.to_grid(state);
@@ -498,30 +515,33 @@ fn compact_state_to_game_state<'py>(
         }
     }
 
-    (
+    Ok((
         PyArray2::from_owned_array_bound(py, grid),
         PyArray2::from_owned_array_bound(py, player_positions),
         PyArray1::from_owned_array_bound(py, walls_remaining),
         PyArray3::from_owned_array_bound(py, old_style_walls),
         current_player,
         completed_steps,
-    )
+    ))
 }
 
 /// Return all child states reachable from a compact state.
 ///
 /// Returns a list of (row, col, action_type, child_state_bytes) tuples where
-/// action_type is 0=vertical wall, 1=horizontal wall, 2=pawn move.
+/// action_type is 0=vertical wall, 1=horizontal wall, 2=pawn move and
+/// `child_state_bytes` is a 24-byte buffer.
 #[cfg(feature = "python")]
 #[pyfunction]
 fn get_compact_child_states(
-    state: u64,
+    py: Python<'_>,
+    state: Vec<u8>,
     board_size: usize,
     max_walls: usize,
     max_steps: usize,
-) -> Vec<(usize, usize, usize, u64)> {
+) -> PyResult<Vec<(usize, usize, usize, Py<PyBytes>)>> {
     use compact::q_game_mechanics::QGameMechanics;
 
+    let state = state_from_bytes(&state)?;
     let mechanics = QGameMechanics::new(board_size, max_walls, max_steps);
     let current_player = mechanics.repr().get_current_player(state);
     let mut data = state;
@@ -534,7 +554,8 @@ fn get_compact_child_states(
         let mut child = data;
         mechanics.execute_move(&mut child, current_player, row, col);
         mechanics.switch_player(&mut child);
-        children.push((row, col, 2usize, child));
+        let child_bytes = PyBytes::new_bound(py, &child.to_bytes()).unbind();
+        children.push((row, col, 2usize, child_bytes));
     }
 
     // Wall placements (action_type = 0 or 1)
@@ -543,10 +564,11 @@ fn get_compact_child_states(
         let mut child = data;
         mechanics.execute_wall_placement(&mut child, current_player, row, col, orientation);
         mechanics.switch_player(&mut child);
-        children.push((row, col, orientation, child));
+        let child_bytes = PyBytes::new_bound(py, &child.to_bytes()).unbind();
+        children.push((row, col, orientation, child_bytes));
     }
 
-    children
+    Ok(children)
 }
 
 /// Python wrapper around PolicyDb for database access from Python.
@@ -587,18 +609,41 @@ impl PyPolicyDb {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
     }
 
-    /// Fetch (state, value) tuples by rowid. State is a u64 packed integer.
-    fn fetch_states_by_rowid(&self, rowids: Vec<i64>) -> PyResult<Vec<(u64, i32)>> {
-        self.db
+    /// Fetch (state, value) tuples by rowid. State is a 24-byte buffer.
+    fn fetch_states_by_rowid(
+        &self,
+        py: Python<'_>,
+        rowids: Vec<i64>,
+    ) -> PyResult<Vec<(Py<PyBytes>, i32)>> {
+        let rows = self
+            .db
             .fetch_states_by_rowid(&rowids)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|(s, v)| (PyBytes::new_bound(py, &s.to_bytes()).unbind(), v))
+            .collect())
     }
 
-    /// Look up (state, value) for the given states.
-    fn lookup_values_by_state(&self, states: Vec<u64>) -> PyResult<Vec<(u64, i32)>> {
-        self.db
-            .lookup_values_by_state(&states)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+    /// Look up (state, value) for the given states. Each input state is a
+    /// 24-byte buffer.
+    fn lookup_values_by_state(
+        &self,
+        py: Python<'_>,
+        states: Vec<Vec<u8>>,
+    ) -> PyResult<Vec<(Py<PyBytes>, i32)>> {
+        let parsed: Vec<compact::q_bit_repr::CompactState> = states
+            .iter()
+            .map(|s| state_from_bytes(s))
+            .collect::<PyResult<_>>()?;
+        let rows = self
+            .db
+            .lookup_values_by_state(&parsed)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|(s, v)| (PyBytes::new_bound(py, &s.to_bytes()).unbind(), v))
+            .collect())
     }
 
     /// Look up action values for a compact state.
@@ -606,7 +651,11 @@ impl PyPolicyDb {
     /// Returns None if no valid actions, otherwise returns
     /// (actions, values) where actions is a list of (row, col, action_type)
     /// and values are from the acting player's perspective.
-    fn lookup_action_values(&self, state: u64) -> PyResult<Option<(Vec<(u8, u8, u8)>, Vec<i32>)>> {
+    fn lookup_action_values(
+        &self,
+        state: Vec<u8>,
+    ) -> PyResult<Option<(Vec<(u8, u8, u8)>, Vec<i32>)>> {
+        let state = state_from_bytes(&state)?;
         self.db
             .lookup_action_values(state)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
@@ -617,14 +666,15 @@ impl PyPolicyDb {
 #[cfg(feature = "python")]
 #[pyfunction]
 fn compact_state_display(
-    state: u64,
+    state: Vec<u8>,
     board_size: usize,
     max_walls: usize,
     max_steps: usize,
-) -> String {
+) -> PyResult<String> {
     use compact::q_bit_repr::QBitRepr;
+    let state = state_from_bytes(&state)?;
     let repr = QBitRepr::new(board_size, max_walls, max_steps);
-    repr.display(state)
+    Ok(repr.display(state))
 }
 
 /// A Python module implemented in Rust.

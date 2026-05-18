@@ -11,10 +11,11 @@ use crate::actions::{
     action_index_to_action, ACTION_MOVE, ACTION_WALL_HORIZONTAL, ACTION_WALL_VERTICAL,
 };
 use crate::agents::ActionSelector;
+use crate::compact::q_bit_repr::CompactState;
+use crate::compact::q_game_mechanics::QGameMechanics;
 use crate::game_state::GameState;
-use crate::grid::CELL_WALL;
-use crate::grid_helpers::grid_game_state_to_resnet_input;
-use crate::rotation::{build_rotated_state, create_rotation_mapping, remap_policy};
+use crate::grid_helpers::compact_state_to_resnet_input;
+use crate::rotation::{create_rotation_mapping, remap_mask, remap_policy, rotate_compact_state};
 
 pub trait PlayGameObserver {
     fn on_state_snapshot(&mut self, step: usize, state: &GameState, action_mask: &[bool]);
@@ -38,86 +39,27 @@ fn format_action(_board_size: i32, row: i32, col: i32, action_type: i32) -> Stri
     }
 }
 
-/// Render the board state as a human-readable string.
+/// Build a transient `GameState` from a compact state.
 ///
-/// Shows player positions as `1` and `2`, walls as `|` (vertical) and `-`
-/// (horizontal), and empty cells as `.`.
-///
-/// The board is always shown in the original (un-rotated) orientation.
-pub fn display_board(
-    grid: &ndarray::ArrayView2<i8>,
-    player_positions: &ndarray::ArrayView2<i32>,
-    walls_remaining: &ndarray::ArrayView1<i32>,
+/// Used only to feed `PlayGameObserver::on_state_snapshot`, which keeps its
+/// `&GameState` signature so the cross-language trace observer in
+/// `python_consistency.rs` stays untouched. Allocates per call (per step); only
+/// called when an observer is attached. Production self-play does not attach an
+/// observer.
+fn compact_to_game_state(
+    mechanics: &QGameMechanics,
+    data: CompactState,
     board_size: i32,
-) -> String {
-    let mut out = String::new();
-    let bs = board_size as usize;
-
-    // Column header
-    out.push_str("    ");
-    for c in 0..bs {
-        out.push_str(&format!(" {} ", c));
-    }
-    out.push('\n');
-
-    let p0_row = player_positions[[0, 0]] as usize;
-    let p0_col = player_positions[[0, 1]] as usize;
-    let p1_row = player_positions[[1, 0]] as usize;
-    let p1_col = player_positions[[1, 1]] as usize;
-
-    for row in 0..bs {
-        // --- cell row ---
-        out.push_str(&format!("{:>3} ", row));
-        for col in 0..bs {
-            // cell content
-            if row == p0_row && col == p0_col {
-                out.push('1');
-            } else if row == p1_row && col == p1_col {
-                out.push('2');
-            } else {
-                out.push('.');
-            }
-
-            // vertical wall to the right
-            if col < bs - 1 {
-                // Grid coord of the gap between (row,col) and (row,col+1)
-                let gr = (row * 2 + 2) as usize;
-                let gc = (col * 2 + 3) as usize;
-                if grid[[gr, gc]] == CELL_WALL {
-                    out.push_str(" | ");
-                } else {
-                    out.push_str("   ");
-                }
-            }
-        }
-        // Metadata on the right of first two rows
-        match row {
-            0 => out.push_str(&format!("   P1 walls: {}", walls_remaining[0])),
-            1 => out.push_str(&format!("   P2 walls: {}", walls_remaining[1])),
-            _ => {}
-        }
-        out.push('\n');
-
-        // --- horizontal wall row between this row and the next ---
-        if row < bs - 1 {
-            out.push_str("    ");
-            for col in 0..bs {
-                // Grid coord of the gap between (row,col) and (row+1,col)
-                let gr = (row * 2 + 3) as usize;
-                let gc = (col * 2 + 2) as usize;
-                if grid[[gr, gc]] == CELL_WALL {
-                    out.push('-');
-                } else {
-                    out.push(' ');
-                }
-                if col < bs - 1 {
-                    out.push_str("   ");
-                }
-            }
-            out.push('\n');
-        }
-    }
-    out
+    max_walls: i32,
+) -> GameState {
+    let repr = mechanics.repr();
+    let mut state = GameState::new(board_size, max_walls);
+    state.grid = repr.to_grid(data);
+    state.player_positions = repr.to_player_positions(data);
+    state.walls_remaining = repr.to_walls_remaining(data);
+    state.current_player = repr.get_current_player(data) as i32;
+    state.completed_steps = repr.get_completed_steps(data);
+    state
 }
 
 /// One turn's training data, stored in "current-player-faces-downward" coords.
@@ -144,15 +86,14 @@ pub struct GameResult {
     pub replay_items: Vec<ReplayBufferItem>,
 }
 
-/// Play a complete game between two agents.
+/// Play a complete game between two agents using the compact state.
 ///
 /// `agent_p1` controls player 0 and `agent_p2` controls player 1.
 /// Player 0 moves first. Action selection runs in original orientation; any
 /// current-player-downward rotation is handled inside evaluator codepaths.
 ///
 /// When `trace` is `true`, each step prints whose turn it is, the action
-/// chosen, and the resulting board state in the original (un-rotated)
-/// orientation.
+/// chosen, and the resulting board state via `QGameMechanics::display`.
 pub fn play_game(
     agent_p1: &mut dyn ActionSelector,
     agent_p2: &mut dyn ActionSelector,
@@ -162,7 +103,9 @@ pub fn play_game(
     trace: bool,
     mut observer: Option<&mut dyn PlayGameObserver>,
 ) -> anyhow::Result<GameResult> {
-    let mut state = GameState::new(board_size, max_walls);
+    let mechanics =
+        QGameMechanics::new(board_size as usize, max_walls as usize, max_steps as usize);
+    let mut data = mechanics.create_initial_state();
     let (original_to_rotated, _) = create_rotation_mapping(board_size);
 
     let mut replay_items: Vec<ReplayBufferItem> = Vec::new();
@@ -171,25 +114,22 @@ pub fn play_game(
     let mut emitted_terminal_snapshot = false;
 
     for step in 0..max_steps {
-        let current_player = state.current_player;
-
-        // Match Python: run action selection in original orientation.
-        let work_state = state.clone();
-        let mask = work_state.get_action_mask();
+        let current_player = mechanics.repr().get_current_player(data) as i32;
+        let mask = mechanics.get_action_mask_immut(data);
 
         if let Some(obs) = observer.as_deref_mut() {
+            let state = compact_to_game_state(&mechanics, data, board_size, max_walls);
             obs.on_state_snapshot(step as usize, &state, &mask);
         }
 
         // Check for no valid actions (shouldn't happen in Quoridor, but be safe)
         if !mask.iter().any(|&m| m) {
-            // Truncate
             emitted_terminal_snapshot = true;
             break;
         }
 
-        // Build ResNet input from the working state
-        let resnet_input = grid_game_state_to_resnet_input(&work_state);
+        // Build ResNet input from the working state (for current-player frame storage).
+        let resnet_input = compact_state_to_resnet_input(&mechanics, data);
 
         // Ask the appropriate agent for action
         let agent: &mut dyn ActionSelector = if current_player == 0 {
@@ -197,7 +137,7 @@ pub fn play_game(
         } else {
             agent_p2
         };
-        let (action_idx, policy) = agent.select_action(&work_state, &mask)?;
+        let (action_idx, policy) = agent.select_action(data, &mechanics, &mask)?;
         let root_value = agent
             .last_selection_trace()
             .and_then(|trace| trace.root_value);
@@ -208,12 +148,16 @@ pub fn play_game(
 
         // Match Python storage semantics: replay is stored in current-player-downward frame.
         let (stored_input_3d, stored_policy, stored_mask) = if current_player == 1 {
-            let rotated_state = build_rotated_state(&state);
-            let rotated_input = grid_game_state_to_resnet_input(&rotated_state)
+            let rotated_data = rotate_compact_state(&mechanics, data);
+            let rotated_input = compact_state_to_resnet_input(&mechanics, rotated_data)
                 .index_axis(ndarray::Axis(0), 0)
                 .to_owned();
             let rotated_policy = remap_policy(&policy, &original_to_rotated);
-            let rotated_mask = rotated_state.get_action_mask();
+            // `QGameMechanics::goal_rows` does not flip under rotation, so the
+            // mask must come from remapping the original mask, not from
+            // re-validating on rotated data (which would treat walls that
+            // block the rotated player's path as legal).
+            let rotated_mask = remap_mask(&mask, &original_to_rotated);
             (rotated_input, rotated_policy, rotated_mask)
         } else {
             (
@@ -231,35 +175,28 @@ pub fn play_game(
             player: current_player,
         });
 
-        // Decode action index → (row, col, type) in working frame
-        let action_triple = action_index_to_action(board_size, action_idx);
-
-        let (a_row, a_col, a_type) = (action_triple[0], action_triple[1], action_triple[2]);
-
-        // Apply action on the ORIGINAL game state
-        state.step([a_row, a_col, a_type]);
+        // Apply action on the canonical compact state
+        mechanics.apply_action_index(&mut data, action_idx);
 
         if trace {
             let player_label = if current_player == 0 { "P1" } else { "P2" };
+            let action_triple = action_index_to_action(board_size, action_idx);
             println!(
                 "--- Step {} | {} ---\n{}",
                 step + 1,
                 player_label,
-                format_action(board_size, a_row, a_col, a_type),
-            );
-            print!(
-                "{}\n",
-                display_board(
-                    &state.grid(),
-                    &state.player_positions(),
-                    &state.walls_remaining(),
-                    board_size
+                format_action(
+                    board_size,
+                    action_triple[0],
+                    action_triple[1],
+                    action_triple[2]
                 ),
             );
+            print!("{}\n", mechanics.display(data));
         }
 
-        // Check win (current_player already switched after step, so check previous player)
-        if state.check_win(current_player) {
+        // Check win (current_player already switched after apply, so check previous player)
+        if mechanics.check_win(data, current_player as usize) {
             winner = Some(current_player);
             // Backfill values: +1 for winner, -1 for loser
             for item in replay_items.iter_mut() {
@@ -277,11 +214,12 @@ pub fn play_game(
         }
     }
 
-    if winner.is_none() && !emitted_terminal_snapshot && state.completed_steps >= max_steps as usize
-    {
-        let mask = state.get_action_mask();
+    let completed_steps = mechanics.repr().get_completed_steps(data);
+    if winner.is_none() && !emitted_terminal_snapshot && completed_steps >= max_steps as usize {
+        let mask = mechanics.get_action_mask_immut(data);
         if let Some(obs) = observer.as_deref_mut() {
-            obs.on_state_snapshot(state.completed_steps, &state, &mask);
+            let state = compact_to_game_state(&mechanics, data, board_size, max_walls);
+            obs.on_state_snapshot(completed_steps, &state, &mask);
         }
     }
 
@@ -304,7 +242,8 @@ mod tests {
     impl ActionSelector for FirstValidAgent {
         fn select_action(
             &mut self,
-            _state: &GameState,
+            _data: CompactState,
+            _mechanics: &QGameMechanics,
             action_mask: &[bool],
         ) -> anyhow::Result<(usize, Vec<f32>)> {
             let idx = action_mask
@@ -323,7 +262,6 @@ mod tests {
         let mut p2 = FirstValidAgent;
         let result = play_game(&mut p1, &mut p2, 5, 3, 200, false, None).unwrap();
 
-        // Game should complete within 200 steps on a 5×5 board
         assert!(result.num_turns > 0);
         assert!(!result.replay_items.is_empty());
     }
@@ -334,8 +272,6 @@ mod tests {
         let mut p2 = FirstValidAgent;
         let result = play_game(&mut p1, &mut p2, 5, 0, 200, false, None).unwrap();
 
-        // With 0 walls the game should end quickly via moves only
-        // Players should alternate
         for (i, item) in result.replay_items.iter().enumerate() {
             assert_eq!(item.player, (i as i32) % 2);
         }
@@ -362,7 +298,6 @@ mod tests {
     fn test_play_game_truncation_values() {
         let mut p1 = FirstValidAgent;
         let mut p2 = FirstValidAgent;
-        // Very short max_steps to force truncation
         let result = play_game(&mut p1, &mut p2, 5, 3, 2, false, None).unwrap();
 
         if result.winner.is_none() {
